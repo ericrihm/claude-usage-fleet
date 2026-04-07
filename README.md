@@ -1,12 +1,12 @@
 # Claude Code Usage Dashboard
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE)
+[![claude-code](https://img.shields.io/badge/claude--code-black?style=flat-square)](https://claude.ai/code)
 
-A local dashboard for tracking your [Claude Code](https://claude.ai/code) token usage, costs, and session history. Reads the JSONL transcript files that Claude Code writes locally and visualizes them in a browser dashboard.
+A local dashboard for tracking your Claude Code token usage, costs, and session history. Reads the JSONL transcript files that Claude Code writes locally and visualizes them in a browser dashboard.
 
 ![Claude Usage Dashboard](docs/screenshot.png)
 
-**GitHub:** https://github.com/phuryn/claude-usage
 **Created by:** [The Product Compass Newsletter](https://www.productcompass.pm)
 
 ---
