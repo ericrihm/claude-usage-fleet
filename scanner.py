@@ -614,25 +614,49 @@ def scan_all(config, db_path=DB_PATH, verbose=True):
     conn = get_db(db_path)
     init_db(conn)
 
-    paths_seen = set()
+    paths_seen = {}
     for acct in config["accounts"]:
-        resolved = str(Path(acct["path"]).expanduser().resolve())
-        assert resolved not in paths_seen, (
-            f"Configured account paths must be disjoint; {acct['name']!r} -> "
-            f"{resolved} was already claimed by another account"
+        all_paths = [acct["path"], *acct.get("extra_paths", [])]
+        for p in all_paths:
+            resolved = str(Path(p).expanduser().resolve())
+            assert resolved not in paths_seen, (
+                f"Configured account paths must be disjoint; {acct['name']!r} -> "
+                f"{resolved} was already claimed by {paths_seen[resolved]!r}"
+            )
+            paths_seen[resolved] = acct["name"]
+
+    # Warn about accounts that are in the DB but not in the current config —
+    # most often caused by a rename in accounts.json, which would otherwise
+    # silently double-count the old name in unfiltered aggregate views.
+    configured_names = {a["name"] for a in config["accounts"]}
+    db_names = {
+        r[0] for r in conn.execute("SELECT DISTINCT account FROM turns").fetchall()
+    }
+    orphans = db_names - configured_names
+    if orphans and verbose:
+        print(
+            f"  [WARN] DB contains accounts not in config: {sorted(orphans)}. "
+            "Their historical rows remain; 'All accounts' views will include "
+            "them. Click Rescan from the dashboard to rebuild from scratch."
         )
-        paths_seen.add(resolved)
 
     rows = []
     for acct in config["accounts"]:
-        projects_dir = Path(acct["path"]).expanduser() / "projects"
-        if not projects_dir.exists():
+        # Primary projects dir, plus any extra_paths (macOS/Xcode integration,
+        # historical log archives, etc.). All get tagged with this account.
+        candidate_dirs = [
+            Path(acct["path"]).expanduser() / "projects",
+            *[Path(p).expanduser() / "projects" for p in acct.get("extra_paths", [])],
+        ]
+        active_dirs = [d for d in candidate_dirs if d.exists()]
+        if not active_dirs:
             if verbose:
-                print(f"  [SKIP] {acct['name']}: {projects_dir} does not exist")
+                missing = ", ".join(str(d) for d in candidate_dirs)
+                print(f"  [SKIP] {acct['name']}: no projects dir found ({missing})")
             rows.append((acct["name"], 0, 0, 0, 0))
             continue
         result = scan(
-            projects_dir=projects_dir,
+            projects_dirs=active_dirs,
             db_path=db_path,
             verbose=verbose,
             account=acct["name"],
