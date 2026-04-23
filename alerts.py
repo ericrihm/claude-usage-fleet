@@ -74,7 +74,48 @@ def _ensure_alert_state_table(conn):
             last_fired_at   TEXT
         )
     """)
+    # Per-webhook delivery log — one row per (account, level, url) tuple that
+    # has been successfully delivered. Lets us retry only the destinations
+    # that failed without re-spamming the ones that already succeeded.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS alert_deliveries (
+            account         TEXT NOT NULL,
+            level           TEXT NOT NULL,
+            url             TEXT NOT NULL,
+            delivered_at    TEXT NOT NULL,
+            PRIMARY KEY (account, level, url)
+        )
+    """)
     conn.commit()
+
+
+def _undelivered_webhooks(conn, config, account, level):
+    """Return the subset of configured webhooks that still need delivery for
+    this (account, level) tuple."""
+    already = {
+        r[0] for r in conn.execute(
+            "SELECT url FROM alert_deliveries WHERE account = ? AND level = ?",
+            (account, level),
+        ).fetchall()
+    }
+    return [wh for wh in config.get("webhooks", [])
+            if level in wh.get("on", ["warn", "critical"])
+            and wh["url"] not in already]
+
+
+def _record_delivery(conn, account, level, url):
+    conn.execute("""
+        INSERT OR REPLACE INTO alert_deliveries (account, level, url, delivered_at)
+        VALUES (?, ?, ?, ?)
+    """, (account, level, url, datetime.now(timezone.utc).isoformat()))
+
+
+def _reset_deliveries_below(conn, account, level):
+    """When an account drops below warn, clear all delivery records so a
+    future re-cross fires fresh notifications to every webhook."""
+    conn.execute(
+        "DELETE FROM alert_deliveries WHERE account = ?", (account,),
+    )
 
 
 def _level_for(fraction, thresholds):
@@ -112,8 +153,13 @@ def _post_webhook(url, payload, timeout=5):
         return False, f"err {e}"
 
 
-def _fire(config, account, level, fraction):
-    """Post the alert to every webhook whose `on` list includes the level."""
+def _fire(webhooks, account, level, fraction):
+    """Post the alert to each webhook in the supplied list.
+
+    The caller (check_and_fire) pre-filters to only the URLs that still need
+    delivery for this (account, level), so this function just does the IO
+    and returns per-webhook results.
+    """
     payload = {
         "account":         account,
         "level":           level,
@@ -121,10 +167,9 @@ def _fire(config, account, level, fraction):
         "block_reset_at":  _block_reset_at(),
     }
     results = []
-    for wh in config.get("webhooks", []):
-        if level in wh.get("on", ["warn", "critical"]):
-            ok, info = _post_webhook(wh["url"], payload)
-            results.append({"url": wh["url"], "ok": ok, "info": info})
+    for wh in webhooks:
+        ok, info = _post_webhook(wh["url"], payload)
+        results.append({"url": wh["url"], "ok": ok, "info": info})
     return payload, results
 
 
@@ -155,43 +200,53 @@ def check_and_fire(config, db_path, quiet=True):
             ).fetchone()
             prev_level = prev[0] if prev else None
 
-            # Dedup: only fire when transitioning to a higher level. Going
-            # back down silently resets state so a future re-cross fires again.
+            # Dedup lives in two layers:
+            #   * alert_state.last_level is the "I've been in this level"
+            #     marker — only flips forward once at least one delivery
+            #     succeeds (so we don't look like we handled a level we
+            #     couldn't deliver for anyone).
+            #   * alert_deliveries is per-webhook — a later tick retries
+            #     only the URLs that haven't been marked delivered yet.
             rank = {None: 0, "warn": 1, "critical": 2}
-            if level and rank[level] > rank[prev_level]:
-                payload, results = _fire(config, acct["name"], level, fraction)
-                # Only mark the crossing as "sent" if at least one delivery
-                # actually succeeded. Otherwise (webhooks list empty, or all
-                # endpoints returned errors) leave the previous state alone
-                # so the next tick retries.
-                any_ok = any(r.get("ok") for r in results)
-                if any_ok:
-                    conn.execute("""
-                        INSERT INTO alert_state (account, last_level, last_fired_at)
-                        VALUES (?, ?, ?)
-                        ON CONFLICT(account) DO UPDATE SET
-                            last_level = excluded.last_level,
-                            last_fired_at = excluded.last_fired_at
-                    """, (acct["name"], level, datetime.now(timezone.utc).isoformat()))
+            is_upgrade = level and rank[level] > rank[prev_level]
+            is_stuck_retry = (
+                level and rank[level] == rank[prev_level] and prev_level
+            )
+
+            if is_upgrade or is_stuck_retry:
+                pending = _undelivered_webhooks(conn, config, acct["name"], level)
+                payload, results = _fire(pending, acct["name"], level, fraction)
+                for r in results:
+                    if r.get("ok"):
+                        _record_delivery(conn, acct["name"], level, r["url"])
+                if results or is_upgrade:
+                    any_ok = any(r.get("ok") for r in results)
+                    if any_ok or is_upgrade:
+                        # First delivery success OR first time noticing the
+                        # crossing — advance last_level. Keeps subsequent
+                        # ticks in the "retry only pending" branch.
+                        new_level_state = level if any_ok else prev_level
+                        conn.execute("""
+                            INSERT INTO alert_state (account, last_level, last_fired_at)
+                            VALUES (?, ?, ?)
+                            ON CONFLICT(account) DO UPDATE SET
+                                last_level = excluded.last_level,
+                                last_fired_at = excluded.last_fired_at
+                        """, (acct["name"], new_level_state,
+                              datetime.now(timezone.utc).isoformat()))
                     conn.commit()
                     fired.append((acct["name"], level, results))
                     if not quiet:
-                        print(f"  alert: {acct['name']} -> {level} ({fraction:.0%})")
-                else:
-                    # Still report the attempt so the cli.py summary shows
-                    # the failure, but don't poison state.
-                    fired.append((acct["name"], level, results))
-                    if not quiet:
-                        print(f"  alert (all deliveries failed): {acct['name']} -> {level}")
-            elif level and level == prev_level:
-                # Same level — touch last_fired_at only so the row doesn't go stale.
-                pass
+                        label = "alert" if any(r.get("ok") for r in results) else "alert (pending retries)"
+                        print(f"  {label}: {acct['name']} -> {level} ({fraction:.0%})")
             elif prev and not level:
-                # Dropped below warn — clear state so a later re-cross fires.
+                # Dropped below warn — clear state and delivery history so a
+                # later re-cross fires fresh notifications to every webhook.
                 conn.execute(
                     "UPDATE alert_state SET last_level = NULL WHERE account = ?",
                     (acct["name"],),
                 )
+                _reset_deliveries_below(conn, acct["name"], level)
                 conn.commit()
     finally:
         conn.close()
@@ -202,5 +257,7 @@ def check_and_fire(config, db_path, quiet=True):
 def fire_test(config, db_path, account, level):
     """Synthesize a test webhook payload — bypasses thresholds and dedup."""
     fraction = 0.99 if level == "critical" else 0.78
-    payload, results = _fire(config, account, level, fraction)
+    webhooks = [wh for wh in config.get("webhooks", [])
+                if level in wh.get("on", ["warn", "critical"])]
+    payload, results = _fire(webhooks, account, level, fraction)
     return payload, results
