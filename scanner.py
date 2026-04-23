@@ -75,6 +75,37 @@ def init_db(conn):
             conn.execute(
                 f"ALTER TABLE {table} ADD COLUMN account TEXT NOT NULL DEFAULT 'default'"
             )
+    # processed_files gets an `account` column and a composite PK. Upstream
+    # keyed solely on `path`, which would let a rename in accounts.json
+    # strand every transcript under the old account name (scanner would see
+    # "path already processed" and skip). With (account, path) as the key,
+    # renaming triggers a fresh scan under the new name while leaving the
+    # old account's rows alone.
+    pf_info = conn.execute("PRAGMA table_info(processed_files)").fetchall()
+    pf_cols = [r[1] for r in pf_info]
+    pf_pk = [r[1] for r in pf_info if r[5] > 0]
+    if pf_pk != ["account", "path"]:
+        account_select = "COALESCE(account, 'default')" if "account" in pf_cols else "'default'"
+        conn.execute("BEGIN")
+        try:
+            conn.executescript(f"""
+                CREATE TABLE processed_files_new (
+                    path     TEXT NOT NULL,
+                    mtime    REAL,
+                    lines    INTEGER,
+                    account  TEXT NOT NULL DEFAULT 'default',
+                    PRIMARY KEY (account, path)
+                );
+                INSERT OR IGNORE INTO processed_files_new (path, mtime, lines, account)
+                SELECT path, mtime, lines, {account_select}
+                FROM processed_files;
+                DROP TABLE processed_files;
+                ALTER TABLE processed_files_new RENAME TO processed_files;
+            """)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
     # The CREATE TABLE above declares session_id as the sole PK. For fresh multi-
     # account installs, and for legacy installs being upgraded, we need the PK
@@ -393,8 +424,8 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True,
             continue
 
         row = conn.execute(
-            "SELECT mtime, lines FROM processed_files WHERE path = ?",
-            (filepath,)
+            "SELECT mtime, lines FROM processed_files WHERE path = ? AND account = ?",
+            (filepath, account)
         ).fetchone()
 
         if row and abs(row["mtime"] - mtime) < 0.01:
@@ -513,8 +544,10 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True,
 
             if line_count <= old_lines:
                 # File didn't grow (mtime changed but no new content)
-                conn.execute("UPDATE processed_files SET mtime = ? WHERE path = ?",
-                             (mtime, filepath))
+                conn.execute(
+                    "UPDATE processed_files SET mtime = ? WHERE path = ? AND account = ?",
+                    (mtime, filepath, account),
+                )
                 conn.commit()
                 skipped_files += 1
                 continue
@@ -536,9 +569,9 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True,
 
         # Record file as processed (line_count already known from the single read)
         conn.execute("""
-            INSERT OR REPLACE INTO processed_files (path, mtime, lines)
-            VALUES (?, ?, ?)
-        """, (filepath, mtime, line_count))
+            INSERT OR REPLACE INTO processed_files (path, mtime, lines, account)
+            VALUES (?, ?, ?, ?)
+        """, (filepath, mtime, line_count, account))
         conn.commit()
 
     # Recompute session totals from actual turns in DB.

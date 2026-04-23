@@ -229,6 +229,33 @@ class TestScanAll(unittest.TestCase):
             conn.close()
         self.assertEqual([r[0] for r in rows], ["alpha", "beta"])
 
+    def test_rename_account_rescans_transcripts(self):
+        """Renaming an account in accounts.json (keeping the same path) must
+        NOT leave the renamed account showing empty because processed_files
+        thinks the JSONL was already ingested."""
+        scanner.scan_all(self.cfg, db_path=self.db, verbose=False)
+
+        renamed = {
+            "accounts": [
+                {"name": "alpha-renamed", "path": str(self.root / "alpha"),
+                 "plan": "max_20x"},
+                {"name": "beta", "path": str(self.root / "beta"), "plan": "pro"},
+            ],
+            "thresholds": {"warn": 0.75, "critical": 0.95},
+            "webhooks": [],
+        }
+        scanner.scan_all(renamed, db_path=self.db, verbose=False)
+
+        conn = sqlite3.connect(self.db)
+        try:
+            accounts = {r[0] for r in conn.execute(
+                "SELECT DISTINCT account FROM turns"
+            ).fetchall()}
+        finally:
+            conn.close()
+        self.assertIn("alpha-renamed", accounts,
+                      "rename stranded data under old account name")
+
     def test_disjoint_paths_asserted(self):
         cfg = dict(self.cfg)
         cfg["accounts"] = [
