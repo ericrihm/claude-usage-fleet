@@ -5,6 +5,7 @@ dashboard.py - Local web dashboard served on localhost:8080.
 import json
 import os
 import sqlite3
+import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from datetime import datetime
@@ -12,6 +13,29 @@ from urllib.parse import urlsplit, parse_qs
 from datetime import timezone, timedelta
 
 DB_PATH = Path.home() / ".claude" / "usage.db"
+
+# Guard so two concurrent /api/data requests can't spawn overlapping alert
+# passes — one at a time is more than enough given 30s polling.
+_ALERT_LOCK = threading.Lock()
+
+
+def _fire_alerts_async():
+    """Run check_and_fire in a daemon thread. A slow/unreachable webhook
+    must not block /api/data; the request-path handler returns immediately."""
+    def _run():
+        if not _ALERT_LOCK.acquire(blocking=False):
+            return  # a previous tick is still working; skip this one
+        try:
+            from config import load_config
+            from alerts import check_and_fire
+            cfg = load_config(quiet=True)
+            if cfg["webhooks"]:
+                check_and_fire(cfg, DB_PATH, quiet=True)
+        except Exception:
+            pass
+        finally:
+            _ALERT_LOCK.release()
+    threading.Thread(target=_run, daemon=True).start()
 
 
 def _iso_cutoff(hours):
@@ -1325,21 +1349,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         if route == "/api/data":
             account = (qs.get("account") or [None])[0]
-            # Auto-refresh is the natural cadence for alert polling, but only
-            # once scan has built the usage schema. If the DB is missing we
-            # must NOT let check_and_fire create an empty shell — that would
-            # break the "Database not found. Run: python cli.py scan" error
-            # path below, because get_dashboard_data would then query turns/
-            # sessions tables that don't yet exist.
+            # Kick off alert polling in the background so a slow webhook can't
+            # add 5+ seconds of latency to every /api/data request. Only when
+            # the DB already exists — otherwise check_and_fire would create
+            # an empty schema shell and mask the "run scan" error message.
             if DB_PATH.exists():
-                try:
-                    from config import load_config
-                    from alerts import check_and_fire
-                    cfg = load_config(quiet=True)
-                    if cfg["webhooks"]:
-                        check_and_fire(cfg, DB_PATH, quiet=True)
-                except Exception:
-                    pass
+                _fire_alerts_async()
             self._json(get_dashboard_data(account=account))
             return
 

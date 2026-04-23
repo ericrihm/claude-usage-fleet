@@ -143,6 +143,47 @@ class TestWindowCutoff(unittest.TestCase):
                 self.assertEqual(tokens, 0, "5h filter admitted a midnight turn")
 
 
+class TestLegacyDbMigration(unittest.TestCase):
+    """Regression: `python cli.py alerts` against a pre-fork database must
+    run the migration itself, not crash with 'no such column: account'."""
+
+    def test_check_and_fire_migrates_legacy_db(self):
+        with tempfile.TemporaryDirectory() as td:
+            dbp = Path(td) / "usage.db"
+            # Create an upstream-shaped DB WITHOUT the account column.
+            conn = sqlite3.connect(dbp)
+            conn.executescript("""
+                CREATE TABLE sessions (
+                    session_id TEXT PRIMARY KEY, project_name TEXT,
+                    first_timestamp TEXT, last_timestamp TEXT, git_branch TEXT,
+                    total_input_tokens INTEGER DEFAULT 0,
+                    total_output_tokens INTEGER DEFAULT 0,
+                    total_cache_read INTEGER DEFAULT 0,
+                    total_cache_creation INTEGER DEFAULT 0,
+                    model TEXT, turn_count INTEGER DEFAULT 0
+                );
+                CREATE TABLE turns (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT,
+                    timestamp TEXT, model TEXT,
+                    input_tokens INTEGER, output_tokens INTEGER,
+                    cache_read_tokens INTEGER, cache_creation_tokens INTEGER,
+                    tool_name TEXT, cwd TEXT
+                );
+                CREATE TABLE processed_files (path TEXT PRIMARY KEY, mtime REAL, lines INTEGER);
+            """)
+            conn.commit()
+            conn.close()
+
+            cfg = {
+                "accounts": [{"name": "default", "path": str(td), "plan": "pro"}],
+                "thresholds": {"warn": 0.75, "critical": 0.95},
+                "webhooks": [],
+            }
+            # Before the fix, this crashed with OperationalError.
+            fired = alerts.check_and_fire(cfg, dbp, quiet=True)
+            self.assertEqual(fired, [])
+
+
 class TestBlockUsage(unittest.TestCase):
     def test_no_activity_returns_zero(self):
         with tempfile.TemporaryDirectory() as td:

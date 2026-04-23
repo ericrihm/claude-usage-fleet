@@ -177,8 +177,15 @@ def check_and_fire(config, db_path, quiet=True):
     """Iterate configured accounts; fire one webhook per account that just
     crossed into a new level. Returns a list of (account, level, results)
     tuples describing what was fired.
+
+    Runs the scanner migration first so a legacy (pre-fork) usage.db gets its
+    `account` column added before we query it — otherwise `python cli.py
+    alerts` against an upstream-shaped DB would crash with 'no such column:
+    account'.
     """
-    conn = sqlite3.connect(db_path)
+    import scanner
+    conn = scanner.get_db(db_path)
+    scanner.init_db(conn)
     _ensure_alert_state_table(conn)
 
     fired = []
