@@ -1376,12 +1376,25 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if self.path == "/api/rescan":
-            # Full rebuild: delete DB and rescan every configured account.
+            # Full rebuild: delete DB and rescan. Match cmd_scan semantics so
+            # single-account users (no accounts.json) still get the upstream
+            # Xcode projects path scanned; multi-account users go through
+            # scan_all.
             if DB_PATH.exists():
                 DB_PATH.unlink()
             try:
-                from config import load_config
-                from scanner import scan_all
+                from config import load_config, DEFAULT_CONFIG_PATH
+                from scanner import scan, scan_all, DEFAULT_PROJECTS_DIRS
+                if not DEFAULT_CONFIG_PATH.exists():
+                    result = scan(projects_dirs=DEFAULT_PROJECTS_DIRS,
+                                  account="default", verbose=False)
+                    self._json({
+                        "new": result["new"], "updated": result["updated"],
+                        "skipped": result["skipped"], "turns": result["turns"],
+                        "accounts": [{"account": "default", **{k: result[k]
+                            for k in ("new", "updated", "skipped", "turns")}}],
+                    })
+                    return
                 cfg = load_config(quiet=True)
                 rows = scan_all(cfg, verbose=False)
                 # Aggregate across accounts for a stable response shape that

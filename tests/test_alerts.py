@@ -222,6 +222,40 @@ class TestCheckAndFire(unittest.TestCase):
                 self.assertEqual(fired, [])
                 self.assertEqual(hook.received, [])
 
+    def test_partial_failure_retries_only_failed_webhook(self):
+        """If webhook A succeeds and B is unreachable, the next tick must
+        retry B only — not A again, and not skip B forever."""
+        with tempfile.TemporaryDirectory() as td:
+            dbp = Path(td) / "usage.db"
+            _seed_usage_above_warn(dbp, "acct1", "pro")
+            with _WebhookServer() as hookA:
+                # Port that refuses connections reliably.
+                dead_url = f"http://127.0.0.1:{_pick_port()}/down"
+                cfg = {
+                    "accounts": [{"name": "acct1", "path": str(td), "plan": "pro"}],
+                    "thresholds": {"warn": 0.75, "critical": 0.95},
+                    "webhooks": [
+                        {"url": hookA.url,  "on": ["warn", "critical"]},
+                        {"url": dead_url,   "on": ["warn", "critical"]},
+                    ],
+                }
+                fired_1 = alerts.check_and_fire(cfg, dbp, quiet=True)
+                self.assertEqual(len(fired_1), 1)
+                # First run: hookA got the payload once, dead_url failed.
+                self.assertEqual(len(hookA.received), 1)
+                results_1 = {r["url"]: r["ok"] for r in fired_1[0][2]}
+                self.assertTrue(results_1[hookA.url])
+                self.assertFalse(results_1[dead_url])
+
+                # Second run with same usage: hookA must NOT receive a
+                # duplicate, but the system must still attempt dead_url.
+                fired_2 = alerts.check_and_fire(cfg, dbp, quiet=True)
+                self.assertEqual(len(hookA.received), 1, "hookA got duplicate delivery")
+                # fired_2 should have an attempt only for dead_url.
+                urls_attempted = [r["url"] for r in fired_2[0][2]] if fired_2 else []
+                self.assertNotIn(hookA.url, urls_attempted, "hookA retried unnecessarily")
+                self.assertIn(dead_url, urls_attempted, "dead_url not retried")
+
     def test_webhook_level_filter_respected(self):
         with tempfile.TemporaryDirectory() as td:
             dbp = Path(td) / "usage.db"
