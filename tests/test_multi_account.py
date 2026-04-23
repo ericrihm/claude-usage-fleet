@@ -70,6 +70,18 @@ class TestConfigLoad(unittest.TestCase):
             with self.assertRaises(config.ConfigError):
                 config.load_config(path=cfg_file, quiet=True)
 
+    def test_windows_path_in_wsl_maps_to_mnt(self):
+        """The README promises that WSL users can put 'C:\\Users\\me\\.claude'
+        in accounts.json. On POSIX, that string must be rewritten to
+        '/mnt/c/Users/me/.claude' before being handed to pathlib — otherwise
+        PurePosixPath treats it as a single relative filename.
+        """
+        if os.name == "nt":
+            self.skipTest("WSL-mapping behavior only applies on POSIX hosts")
+        resolved = config._resolve_path(r"C:\Users\me\.claude-acct3")
+        self.assertTrue(str(resolved).startswith("/mnt/c/Users/me"),
+                        f"expected /mnt/c mapping, got {resolved!r}")
+
     def test_invalid_plan_rejected(self):
         with tempfile.TemporaryDirectory() as td:
             cfg_file = Path(td) / "accounts.json"
