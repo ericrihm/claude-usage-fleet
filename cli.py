@@ -273,6 +273,29 @@ def cmd_stats():
     conn.close()
 
 
+def cmd_alerts():
+    """Compute per-account block usage and fire any crossed-threshold webhooks.
+
+    Idempotent: running twice without new activity fires nothing the second
+    time thanks to alert_state dedup.
+    """
+    from config import load_config
+    from alerts import check_and_fire
+
+    cfg = load_config()
+    if not cfg["webhooks"]:
+        print("No webhooks configured in accounts.json — nothing to send.")
+    fired = check_and_fire(cfg, DB_PATH, quiet=False)
+    if fired:
+        print(f"\nFired {len(fired)} alert(s):")
+        for account, level, results in fired:
+            for r in results:
+                status = "ok" if r["ok"] else "FAIL"
+                print(f"  [{status}] {account} {level} -> {r['url']} ({r['info']})")
+    else:
+        print("No threshold crossings this run.")
+
+
 def cmd_dashboard(projects_dir=None):
     import webbrowser
     import threading
@@ -299,12 +322,13 @@ def cmd_dashboard(projects_dir=None):
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 USAGE = """
-Claude Code Usage Dashboard
+Claude Code Usage Dashboard (claude-usage-fleet)
 
 Usage:
-  python cli.py scan [--projects-dir PATH]   Scan JSONL files and update database
+  python cli.py scan [--projects-dir PATH]   Scan configured accounts (or a single path) into the DB
   python cli.py today                        Show today's usage summary
   python cli.py stats                        Show all-time statistics
+  python cli.py alerts                       Check per-account block usage, fire webhooks on threshold crossings
   python cli.py dashboard [--projects-dir PATH]  Scan + start dashboard
 """
 
@@ -312,6 +336,7 @@ COMMANDS = {
     "scan": cmd_scan,
     "today": cmd_today,
     "stats": cmd_stats,
+    "alerts": cmd_alerts,
     "dashboard": cmd_dashboard,
 }
 
