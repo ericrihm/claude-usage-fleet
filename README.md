@@ -142,11 +142,14 @@ If you run Claude Code under more than one profile (different subscriptions, sep
 Copy `accounts.json.example` for a starting point. When `~/.claude/accounts.json` is absent the fork behaves exactly like upstream — one "default" account pointing at `~/.claude/projects/`. `accounts.json` is in `.gitignore`.
 
 - **Paths** accept `~` expansion and both POSIX (`/home/me/...`) and Windows (`C:\Users\me\...`) formats. WSL users can mix WSL-native paths and `/mnt/c/...` paths in the same config — the scanner normalizes via `pathlib.Path`.
+- **`extra_paths`** (optional per-account list) scans additional transcript roots under the same account name. macOS users who run Claude Code from both the CLI and the Xcode integration can list `~/Library/Developer/Xcode/CodingAssistant/ClaudeAgentConfig` here to pull in both sources.
 - **Plans** are `api`, `pro`, `max_5x`, `max_20x`, or omitted. Plan determines the denominator for the 5-hour block progress bars (`pro ≈ 44k`, `max_5x ≈ 88k`, `max_20x ≈ 220k` tokens per 5h block — community estimates; `api` and omitted have no limit and are never alerted on).
 - **Thresholds** drive the header strip colors (green below `warn`, yellow at `warn`, red at `critical`) and whether `alerts` fires a webhook.
 - **Webhooks** get a JSON POST with `{account, level, usage_fraction, block_reset_at}` when the account first crosses each threshold. Alert state is stored in an `alert_state` SQLite table so re-runs don't re-spam; downgrading below the threshold silently resets so a later re-cross fires again.
 
 Running `python cli.py scan` walks every configured account and prints a summary table; `python cli.py dashboard` shows all accounts by default with a filter dropdown and a Compare Accounts tab. Schedule `python cli.py alerts` in cron (Linux/macOS) or Task Scheduler (Windows) to get webhooks between manual runs.
+
+**Renaming an account:** if you change an account's `name` in `accounts.json` while keeping the same path, the old name's historical rows stay in the DB (so they still show up in filtered views) and the scanner warns on the next run. Click **Rescan** in the dashboard or delete `~/.claude/usage.db` to rebuild under only the current names.
 
 ---
 

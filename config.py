@@ -28,6 +28,7 @@ def _single_account_fallback():
             "name": "default",
             "path": str(Path.home() / ".claude"),
             "plan": None,
+            "extra_paths": [],
         }],
         "thresholds": dict(DEFAULT_THRESHOLDS),
         "webhooks": [],
@@ -75,7 +76,20 @@ def _validate_account(acct, idx):
         raise ConfigError(
             f"accounts[{idx}].plan={plan!r} — must be one of {sorted(str(p) for p in VALID_PLANS)}"
         )
-    return {"name": name, "path": str(_resolve_path(path)), "plan": plan}
+    # extra_paths lets an account pull transcripts from multiple locations —
+    # e.g. macOS users who run Claude Code from both the CLI and the Xcode
+    # integration can list '~/Library/Developer/Xcode/CodingAssistant/ClaudeAgentConfig'
+    # here so its projects/ dir is scanned alongside the main path.
+    extras_raw = acct.get("extra_paths") or []
+    if not isinstance(extras_raw, list):
+        raise ConfigError(f"accounts[{idx}].extra_paths must be a list")
+    extras = [str(_resolve_path(p)) for p in extras_raw if isinstance(p, str)]
+    return {
+        "name": name,
+        "path": str(_resolve_path(path)),
+        "plan": plan,
+        "extra_paths": extras,
+    }
 
 
 def load_config(path=None, quiet=False):
