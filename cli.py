@@ -68,10 +68,16 @@ def hr(char="-", width=60):
     print(char * width)
 
 def require_db():
+    """Open the usage DB, running the scanner migration in passing so that
+    `today` and `stats` work against a pre-fork DB without a manual `scan`.
+    The migration only adds columns/indexes — it's idempotent and cheap."""
     if not DB_PATH.exists():
         print("Database not found. Run: python cli.py scan")
         sys.exit(1)
-    return sqlite3.connect(DB_PATH)
+    import scanner
+    conn = scanner.get_db(DB_PATH)
+    scanner.init_db(conn)
+    return conn
 
 
 # ── Commands ──────────────────────────────────────────────────────────────────
