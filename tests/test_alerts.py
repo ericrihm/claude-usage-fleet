@@ -297,6 +297,46 @@ class TestCheckAndFire(unittest.TestCase):
                 self.assertNotIn(hookA.url, urls_attempted, "hookA retried unnecessarily")
                 self.assertIn(dead_url, urls_attempted, "dead_url not retried")
 
+    def test_critical_to_warn_to_critical_fires_second_critical(self):
+        """Rolling 5h window can naturally go critical -> warn -> critical
+        without dropping to zero. The second critical crossing must fire —
+        previously last_level stayed at 'critical' through the warn dip, so
+        the re-upgrade was treated as a no-op."""
+        with tempfile.TemporaryDirectory() as td:
+            dbp = Path(td) / "usage.db"
+            # Seed 0.80 — warn, then 0.98 — critical (first critical fires).
+            _seed_usage_above_warn(dbp, "acct1", "pro")
+            _seed_usage_above_critical(dbp, "acct1", "pro")
+
+            with _WebhookServer() as hook:
+                cfg = {
+                    "accounts": [{"name": "acct1", "path": str(td), "plan": "pro"}],
+                    "thresholds": {"warn": 0.75, "critical": 0.95},
+                    "webhooks": [{"url": hook.url, "on": ["warn", "critical"]}],
+                }
+                # warn fires, then a second pass fires critical.
+                alerts.check_and_fire(cfg, dbp, quiet=True)  # warn
+                alerts.check_and_fire(cfg, dbp, quiet=True)  # critical
+
+                # Drop back into warn range — wipe the critical turn's tokens.
+                conn = scanner.get_db(dbp)
+                conn.execute("DELETE FROM turns WHERE message_id = 'm-acct1-crit'")
+                conn.commit()
+                conn.close()
+
+                # This tick should see prev=critical, level=warn — a downgrade.
+                alerts.check_and_fire(cfg, dbp, quiet=True)
+                # Cross back into critical.
+                _seed_usage_above_critical(dbp, "acct1", "pro")
+                fired = alerts.check_and_fire(cfg, dbp, quiet=True)
+
+                # Should fire critical *again* — previously this was swallowed.
+                critical_posts = [r for r in hook.received
+                                  if r["payload"]["level"] == "critical"]
+                self.assertEqual(len(critical_posts), 2,
+                                 "second critical crossing was suppressed")
+                self.assertTrue(fired and fired[-1][1] == "critical")
+
     def test_webhook_level_filter_respected(self):
         with tempfile.TemporaryDirectory() as td:
             dbp = Path(td) / "usage.db"

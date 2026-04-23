@@ -246,14 +246,25 @@ def check_and_fire(config, db_path, quiet=True):
                     if not quiet:
                         label = "alert" if any(r.get("ok") for r in results) else "alert (pending retries)"
                         print(f"  {label}: {acct['name']} -> {level} ({fraction:.0%})")
-            elif prev and not level:
-                # Dropped below warn — clear state and delivery history so a
-                # later re-cross fires fresh notifications to every webhook.
+            elif prev and rank.get(level, 0) < rank[prev_level]:
+                # Downgrade (critical -> warn, warn -> None, or critical ->
+                # None). Clear delivery history for any level strictly higher
+                # than the new state so a re-cross fires fresh. Also reset
+                # last_level so the next upgrade is detected as one.
+                stale_levels = [
+                    lvl for lvl, r in rank.items()
+                    if lvl is not None and r > rank.get(level, 0)
+                ]
+                for stale in stale_levels:
+                    conn.execute(
+                        "DELETE FROM alert_deliveries "
+                        "WHERE account = ? AND level = ?",
+                        (acct["name"], stale),
+                    )
                 conn.execute(
-                    "UPDATE alert_state SET last_level = NULL WHERE account = ?",
-                    (acct["name"],),
+                    "UPDATE alert_state SET last_level = ? WHERE account = ?",
+                    (level, acct["name"]),
                 )
-                _reset_deliveries_below(conn, acct["name"], level)
                 conn.commit()
     finally:
         conn.close()
