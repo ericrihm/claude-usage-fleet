@@ -1313,7 +1313,11 @@ async function initialLoad() {
 }
 
 initialLoad();
-setInterval(() => { loadData(); loadHeaderStrip(); }, 30000);
+setInterval(() => {
+  loadData();
+  loadHeaderStrip();
+  if (currentTab === 'compare') loadCompare();
+}, 30000);
 </script>
 </body>
 </html>
