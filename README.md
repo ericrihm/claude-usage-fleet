@@ -1,9 +1,11 @@
-# Claude Code Usage Dashboard
+# Claude Code Usage Dashboard — Fleet Edition
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE)
 [![claude-code](https://img.shields.io/badge/claude--code-black?style=flat-square)](https://claude.ai/code)
 
-**Pro and Max subscribers get a progress bar. This gives you the full picture.**
+**Pro and Max subscribers get a progress bar. This gives you the full picture — across every account you run.**
+
+This is a fork of [phuryn/claude-usage](https://github.com/phuryn/claude-usage) that adds multi-account support: track several `CLAUDE_CONFIG_DIR` profiles in one dashboard, compare them side-by-side, and fire webhooks when any of them approaches its 5-hour block limit. See [CHANGELOG.md](CHANGELOG.md) for the list of additions.
 
 Claude Code writes detailed usage logs locally — token counts, models, sessions, projects — regardless of your plan. This dashboard reads those logs and turns them into charts and cost estimates. Works on API, Pro, and Max plans.
 
@@ -68,6 +70,9 @@ python cli.py today
 # Show all-time statistics (in terminal)
 python cli.py stats
 
+# Check per-account 5h block usage and fire webhook alerts
+python cli.py alerts
+
 # Scan + open browser dashboard at http://localhost:8080
 python cli.py dashboard
 
@@ -115,10 +120,43 @@ Costs are calculated using **Anthropic API pricing as of April 2026** ([claude.c
 
 ---
 
+## Multi-account setup
+
+If you run Claude Code under more than one profile (different subscriptions, separate accounts per client, etc.), point each profile at its own `CLAUDE_CONFIG_DIR` and list them in `~/.claude/accounts.json`:
+
+```json
+{
+  "accounts": [
+    {"name": "acct1", "path": "~/.claude-acct1", "plan": "max_20x"},
+    {"name": "acct2", "path": "~/.claude-acct2", "plan": "max_5x"},
+    {"name": "acct3", "path": "/mnt/c/Users/me/.claude-acct3", "plan": "pro"},
+    {"name": "acct4", "path": "/mnt/c/Users/me/.claude-acct4", "plan": "pro"}
+  ],
+  "thresholds": { "warn": 0.75, "critical": 0.95 },
+  "webhooks": [
+    {"url": "https://ntfy.sh/your-topic-here", "on": ["warn", "critical"]}
+  ]
+}
+```
+
+Copy `accounts.json.example` for a starting point. When `~/.claude/accounts.json` is absent the fork behaves exactly like upstream — one "default" account pointing at `~/.claude/projects/`. `accounts.json` is in `.gitignore`.
+
+- **Paths** accept `~` expansion and both POSIX (`/home/me/...`) and Windows (`C:\Users\me\...`) formats. WSL users can mix WSL-native paths and `/mnt/c/...` paths in the same config — the scanner normalizes via `pathlib.Path`.
+- **Plans** are `api`, `pro`, `max_5x`, `max_20x`, or omitted. Plan determines the denominator for the 5-hour block progress bars (`pro ≈ 44k`, `max_5x ≈ 88k`, `max_20x ≈ 220k` tokens per 5h block — community estimates; `api` and omitted have no limit and are never alerted on).
+- **Thresholds** drive the header strip colors (green below `warn`, yellow at `warn`, red at `critical`) and whether `alerts` fires a webhook.
+- **Webhooks** get a JSON POST with `{account, level, usage_fraction, block_reset_at}` when the account first crosses each threshold. Alert state is stored in an `alert_state` SQLite table so re-runs don't re-spam; downgrading below the threshold silently resets so a later re-cross fires again.
+
+Running `python cli.py scan` walks every configured account and prints a summary table; `python cli.py dashboard` shows all accounts by default with a filter dropdown and a Compare Accounts tab. Schedule `python cli.py alerts` in cron (Linux/macOS) or Task Scheduler (Windows) to get webhooks between manual runs.
+
+---
+
 ## Files
 
 | File | Purpose |
 |------|---------|
-| `scanner.py` | Parses JSONL transcripts, writes to `~/.claude/usage.db` |
-| `dashboard.py` | HTTP server + single-page HTML/JS dashboard |
-| `cli.py` | `scan`, `today`, `stats`, `dashboard` commands |
+| `scanner.py` | Parses JSONL transcripts, writes to `~/.claude/usage.db`; `scan_all()` walks every configured account |
+| `dashboard.py` | HTTP server + single-page HTML/JS dashboard with account filter and Compare tab |
+| `cli.py` | `scan`, `today`, `stats`, `alerts`, `dashboard` commands |
+| `config.py` | Loads `accounts.json`; falls back to single-account defaults when missing |
+| `alerts.py` | Per-account block usage, threshold crossings, webhook firing with dedup |
+| `accounts.json.example` | Reference config with 4 profiles and a webhook entry |
