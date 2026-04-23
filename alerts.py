@@ -18,6 +18,19 @@ import urllib.request
 import urllib.error
 from datetime import datetime, timezone, timedelta
 
+
+def _iso_cutoff(window_hours):
+    """Format a cutoff timestamp the same way JSONL records do: '...T...Z'.
+
+    SQLite's datetime('now') returns 'YYYY-MM-DD HH:MM:SS' (space separator),
+    but transcripts store 'YYYY-MM-DDTHH:MM:SSZ'. Comparing the two as TEXT
+    is wrong: 'T' (0x54) sorts after ' ' (0x20), so turns from the same UTC
+    day slip through a naive `timestamp >= datetime('now', '-Nh')` filter.
+    Generate the cutoff in Python so the comparison lines up.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=window_hours)
+    return cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
+
 # Plan limits: total tokens per 5-hour block. Source: Maciek-roboblog monitor.
 # These are best-effort community-calibrated estimates — revise if Anthropic
 # publishes official figures.
@@ -34,13 +47,13 @@ BLOCK_WINDOW_HOURS = 5
 def compute_block_tokens(conn, account, window_hours=BLOCK_WINDOW_HOURS):
     """Sum of input+output+cache_read+cache_creation tokens in the last N hours
     for one account. 0 if there's no recent activity."""
-    row = conn.execute(f"""
+    row = conn.execute("""
         SELECT COALESCE(SUM(
             input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens
         ), 0) as total
         FROM turns
-        WHERE account = ? AND timestamp >= datetime('now', ?)
-    """, (account, f'-{window_hours} hours')).fetchone()
+        WHERE account = ? AND timestamp >= ?
+    """, (account, _iso_cutoff(window_hours))).fetchone()
     return int(row[0] or 0)
 
 
@@ -147,25 +160,38 @@ def check_and_fire(config, db_path, quiet=True):
             rank = {None: 0, "warn": 1, "critical": 2}
             if level and rank[level] > rank[prev_level]:
                 payload, results = _fire(config, acct["name"], level, fraction)
-                conn.execute("""
-                    INSERT INTO alert_state (account, last_level, last_fired_at)
-                    VALUES (?, ?, ?)
-                    ON CONFLICT(account) DO UPDATE SET
-                        last_level = excluded.last_level,
-                        last_fired_at = excluded.last_fired_at
-                """, (acct["name"], level, datetime.now(timezone.utc).isoformat()))
-                conn.commit()
-                fired.append((acct["name"], level, results))
-                if not quiet:
-                    print(f"  alert: {acct['name']} -> {level} ({fraction:.0%})")
-            elif level != prev_level:
-                # Same level or downgrade — update state without firing.
-                conn.execute("""
-                    INSERT INTO alert_state (account, last_level, last_fired_at)
-                    VALUES (?, ?, ?)
-                    ON CONFLICT(account) DO UPDATE SET
-                        last_level = excluded.last_level
-                """, (acct["name"], level, datetime.now(timezone.utc).isoformat()))
+                # Only mark the crossing as "sent" if at least one delivery
+                # actually succeeded. Otherwise (webhooks list empty, or all
+                # endpoints returned errors) leave the previous state alone
+                # so the next tick retries.
+                any_ok = any(r.get("ok") for r in results)
+                if any_ok:
+                    conn.execute("""
+                        INSERT INTO alert_state (account, last_level, last_fired_at)
+                        VALUES (?, ?, ?)
+                        ON CONFLICT(account) DO UPDATE SET
+                            last_level = excluded.last_level,
+                            last_fired_at = excluded.last_fired_at
+                    """, (acct["name"], level, datetime.now(timezone.utc).isoformat()))
+                    conn.commit()
+                    fired.append((acct["name"], level, results))
+                    if not quiet:
+                        print(f"  alert: {acct['name']} -> {level} ({fraction:.0%})")
+                else:
+                    # Still report the attempt so the cli.py summary shows
+                    # the failure, but don't poison state.
+                    fired.append((acct["name"], level, results))
+                    if not quiet:
+                        print(f"  alert (all deliveries failed): {acct['name']} -> {level}")
+            elif level and level == prev_level:
+                # Same level — touch last_fired_at only so the row doesn't go stale.
+                pass
+            elif prev and not level:
+                # Dropped below warn — clear state so a later re-cross fires.
+                conn.execute(
+                    "UPDATE alert_state SET last_level = NULL WHERE account = ?",
+                    (acct["name"],),
+                )
                 conn.commit()
     finally:
         conn.close()

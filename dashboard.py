@@ -9,8 +9,19 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from datetime import datetime
 from urllib.parse import urlsplit, parse_qs
+from datetime import timezone, timedelta
 
 DB_PATH = Path.home() / ".claude" / "usage.db"
+
+
+def _iso_cutoff(hours):
+    """Return an ISO-8601 'Z' timestamp for N hours ago — format matches the
+    strings stored in turns.timestamp. Using SQLite's datetime('now', ?) here
+    would produce 'YYYY-MM-DD ...' (space separator) and mis-compare against
+    'YYYY-MM-DDT...Z' strings because 'T' (0x54) sorts after ' ' (0x20)."""
+    return (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
 
 
 def _account_filter(account):
@@ -171,7 +182,7 @@ def get_compare_data(db_path=DB_PATH, window="5h"):
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     try:
-        rows = conn.execute(f"""
+        rows = conn.execute("""
             SELECT
                 account,
                 SUM(input_tokens)           as input,
@@ -181,9 +192,11 @@ def get_compare_data(db_path=DB_PATH, window="5h"):
                 COUNT(*)                    as turns,
                 COUNT(DISTINCT session_id)  as sessions
             FROM turns
-            WHERE timestamp >= datetime('now', ?)
+            WHERE timestamp >= ?
             GROUP BY account
-        """, (f'-{hours} hours',)).fetchall()
+            -- session_id is already unique within each account group so a
+            -- composite key isn't needed here.
+        """, (_iso_cutoff(hours),)).fetchall()
     finally:
         conn.close()
 
