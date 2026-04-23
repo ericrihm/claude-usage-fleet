@@ -1325,16 +1325,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         if route == "/api/data":
             account = (qs.get("account") or [None])[0]
-            # Auto-refresh is the natural cadence for alert polling — one query
-            # per account, cheap. Errors shouldn't break the dashboard.
-            try:
-                from config import load_config
-                from alerts import check_and_fire
-                cfg = load_config(quiet=True)
-                if cfg["webhooks"]:
-                    check_and_fire(cfg, DB_PATH, quiet=True)
-            except Exception:
-                pass
+            # Auto-refresh is the natural cadence for alert polling, but only
+            # once scan has built the usage schema. If the DB is missing we
+            # must NOT let check_and_fire create an empty shell — that would
+            # break the "Database not found. Run: python cli.py scan" error
+            # path below, because get_dashboard_data would then query turns/
+            # sessions tables that don't yet exist.
+            if DB_PATH.exists():
+                try:
+                    from config import load_config
+                    from alerts import check_and_fire
+                    cfg = load_config(quiet=True)
+                    if cfg["webhooks"]:
+                        check_and_fire(cfg, DB_PATH, quiet=True)
+                except Exception:
+                    pass
             self._json(get_dashboard_data(account=account))
             return
 

@@ -34,9 +34,31 @@ def _single_account_fallback():
     }
 
 
+_WIN_DRIVE_RE = None  # lazily imported
+
+
+def _looks_like_windows_path(s):
+    """Return True for 'C:\\...' or 'C:/...' style paths."""
+    import re
+    global _WIN_DRIVE_RE
+    if _WIN_DRIVE_RE is None:
+        _WIN_DRIVE_RE = re.compile(r"^[A-Za-z]:[\\/]")
+    return bool(_WIN_DRIVE_RE.match(s))
+
+
 def _resolve_path(p):
-    """Expand ~ and return an absolute Path. Accepts POSIX or Windows paths."""
-    return Path(os.path.expanduser(str(p))).resolve()
+    """Expand ~ and return an absolute Path. Handles the WSL/Windows mixed
+    case that the README advertises: on POSIX (including WSL), 'C:\\Users\\me'
+    is mapped to '/mnt/c/Users/me' before pathlib.Path touches it, since
+    PurePosixPath otherwise treats the drive-letter segment as a relative
+    filename and silently points at the wrong directory.
+    """
+    s = os.path.expanduser(str(p))
+    if os.name != "nt" and _looks_like_windows_path(s):
+        drive = s[0].lower()
+        remainder = s[2:].lstrip("\\/").replace("\\", "/")
+        s = f"/mnt/{drive}/{remainder}"
+    return Path(s.replace("\\", "/") if os.name != "nt" else s).resolve()
 
 
 def _validate_account(acct, idx):
