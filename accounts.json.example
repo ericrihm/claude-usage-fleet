@@ -1,0 +1,19 @@
+{
+  "_comment": "Copy to ~/.claude/accounts.json and fill in your paths. Each 'path' must point at a CLAUDE_CONFIG_DIR (the directory that contains a 'projects/' subdirectory). If this file is absent, the tool falls back to scanning ~/.claude/projects/ only (single-account mode).",
+
+  "accounts": [
+    {"name": "acct1", "path": "~/.claude-acct1", "plan": "max_20x"},
+    {"name": "acct2", "path": "~/.claude-acct2", "plan": "max_5x"},
+    {"name": "acct3", "path": "/mnt/c/Users/USERNAME/.claude-acct3", "plan": "pro"},
+    {"name": "acct4", "path": "/mnt/c/Users/USERNAME/.claude-acct4", "plan": "pro"}
+  ],
+
+  "thresholds": {
+    "warn": 0.75,
+    "critical": 0.95
+  },
+
+  "webhooks": [
+    {"url": "https://ntfy.sh/your-topic-here", "on": ["warn", "critical"]}
+  ]
+}
