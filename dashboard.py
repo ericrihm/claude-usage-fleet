@@ -1402,19 +1402,29 @@ class DashboardHandler(BaseHTTPRequestHandler):
             # scan_all.
             # Wait for any in-flight alert thread to drop its DB handle — on
             # Windows DB_PATH.unlink() raises PermissionError if the file is
-            # open. A short wait beats failing the user's rescan click.
-            _ALERT_LOCK.acquire(timeout=10)
+            # open. A short wait beats failing the user's rescan click. If we
+            # still can't acquire the lock within 10s (slow webhooks backing
+            # up), fall through without holding it and let the retry-on-
+            # PermissionError path handle it gracefully.
+            have_lock = _ALERT_LOCK.acquire(timeout=10)
             try:
                 if DB_PATH.exists():
-                    try:
-                        DB_PATH.unlink()
-                    except PermissionError:
-                        # Background thread still holding it; give it a moment.
-                        import time
-                        time.sleep(0.5)
-                        DB_PATH.unlink()
+                    for attempt in range(3):
+                        try:
+                            DB_PATH.unlink()
+                            break
+                        except PermissionError:
+                            import time
+                            time.sleep(0.5)
+                    else:
+                        self._json({
+                            "ok": False,
+                            "error": "usage.db is locked — an alert pass is still running; try again shortly.",
+                        }, status=503)
+                        return
             finally:
-                _ALERT_LOCK.release()
+                if have_lock:
+                    _ALERT_LOCK.release()
             try:
                 from config import load_config, DEFAULT_CONFIG_PATH
                 from scanner import scan, scan_all, DEFAULT_PROJECTS_DIRS

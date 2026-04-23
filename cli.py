@@ -296,13 +296,22 @@ def cmd_stats():
 def cmd_alerts():
     """Compute per-account block usage and fire any crossed-threshold webhooks.
 
-    Idempotent: running twice without new activity fires nothing the second
-    time thanks to alert_state dedup.
+    First ingests any fresh JSONL transcripts so a scheduled cron run sees
+    current-tick data instead of stale snapshots. Idempotent: running twice
+    without new activity fires nothing the second time thanks to alert_state
+    dedup.
     """
-    from config import load_config
+    from config import load_config, config_summary_line, DEFAULT_CONFIG_PATH
     from alerts import check_and_fire
+    from scanner import scan, scan_all, DEFAULT_PROJECTS_DIRS
 
     cfg = load_config()
+    # Refresh the DB so thresholds see current data.
+    if DEFAULT_CONFIG_PATH.exists():
+        scan_all(cfg, verbose=False)
+    else:
+        scan(projects_dirs=DEFAULT_PROJECTS_DIRS, account="default", verbose=False)
+
     if not cfg["webhooks"]:
         print("No webhooks configured in accounts.json — nothing to send.")
     fired = check_and_fire(cfg, DB_PATH, quiet=False)
