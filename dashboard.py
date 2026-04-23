@@ -1400,8 +1400,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
             # single-account users (no accounts.json) still get the upstream
             # Xcode projects path scanned; multi-account users go through
             # scan_all.
-            if DB_PATH.exists():
-                DB_PATH.unlink()
+            # Wait for any in-flight alert thread to drop its DB handle — on
+            # Windows DB_PATH.unlink() raises PermissionError if the file is
+            # open. A short wait beats failing the user's rescan click.
+            _ALERT_LOCK.acquire(timeout=10)
+            try:
+                if DB_PATH.exists():
+                    try:
+                        DB_PATH.unlink()
+                    except PermissionError:
+                        # Background thread still holding it; give it a moment.
+                        import time
+                        time.sleep(0.5)
+                        DB_PATH.unlink()
+            finally:
+                _ALERT_LOCK.release()
             try:
                 from config import load_config, DEFAULT_CONFIG_PATH
                 from scanner import scan, scan_all, DEFAULT_PROJECTS_DIRS

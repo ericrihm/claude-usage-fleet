@@ -222,30 +222,47 @@ def check_and_fire(config, db_path, quiet=True):
 
             if is_upgrade or is_stuck_retry:
                 pending = _undelivered_webhooks(conn, config, acct["name"], level)
-                payload, results = _fire(pending, acct["name"], level, fraction)
-                for r in results:
-                    if r.get("ok"):
-                        _record_delivery(conn, acct["name"], level, r["url"])
-                if results or is_upgrade:
-                    any_ok = any(r.get("ok") for r in results)
-                    if any_ok or is_upgrade:
-                        # First delivery success OR first time noticing the
-                        # crossing — advance last_level. Keeps subsequent
-                        # ticks in the "retry only pending" branch.
-                        new_level_state = level if any_ok else prev_level
+                if not pending:
+                    # No webhook subscribes to this level (empty list or all
+                    # already delivered). On a real upgrade, still advance
+                    # last_level so the state machine doesn't loop forever
+                    # treating it as "still in retry" — but don't record a
+                    # phantom fire attempt.
+                    if is_upgrade:
                         conn.execute("""
                             INSERT INTO alert_state (account, last_level, last_fired_at)
                             VALUES (?, ?, ?)
                             ON CONFLICT(account) DO UPDATE SET
                                 last_level = excluded.last_level,
                                 last_fired_at = excluded.last_fired_at
-                        """, (acct["name"], new_level_state,
+                        """, (acct["name"], level,
                               datetime.now(timezone.utc).isoformat()))
-                    conn.commit()
-                    fired.append((acct["name"], level, results))
-                    if not quiet:
-                        label = "alert" if any(r.get("ok") for r in results) else "alert (pending retries)"
-                        print(f"  {label}: {acct['name']} -> {level} ({fraction:.0%})")
+                        conn.commit()
+                    # Fall through to the next account.
+                    continue
+                payload, results = _fire(pending, acct["name"], level, fraction)
+                for r in results:
+                    if r.get("ok"):
+                        _record_delivery(conn, acct["name"], level, r["url"])
+                any_ok = any(r.get("ok") for r in results)
+                if any_ok or is_upgrade:
+                    # First delivery success OR first time noticing the
+                    # crossing — advance last_level. Keeps subsequent
+                    # ticks in the "retry only pending" branch.
+                    new_level_state = level if any_ok else prev_level
+                    conn.execute("""
+                        INSERT INTO alert_state (account, last_level, last_fired_at)
+                        VALUES (?, ?, ?)
+                        ON CONFLICT(account) DO UPDATE SET
+                            last_level = excluded.last_level,
+                            last_fired_at = excluded.last_fired_at
+                    """, (acct["name"], new_level_state,
+                          datetime.now(timezone.utc).isoformat()))
+                conn.commit()
+                fired.append((acct["name"], level, results))
+                if not quiet:
+                    label = "alert" if any_ok else "alert (pending retries)"
+                    print(f"  {label}: {acct['name']} -> {level} ({fraction:.0%})")
             elif prev and rank.get(level, 0) < rank[prev_level]:
                 # Downgrade (critical -> warn, warn -> None, or critical ->
                 # None). Clear delivery history for any level strictly higher
