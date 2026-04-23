@@ -77,8 +77,21 @@ def require_db():
 # ── Commands ──────────────────────────────────────────────────────────────────
 
 def cmd_scan(projects_dir=None):
-    from scanner import scan
-    scan(projects_dir=Path(projects_dir) if projects_dir else None)
+    """Scan all configured accounts (from accounts.json) into the shared DB.
+
+    If --projects-dir is given, bypasses the config and scans that one path
+    under the 'default' account — handy for debugging or one-off imports.
+    """
+    from scanner import scan, scan_all
+    from config import load_config, config_summary_line
+
+    if projects_dir:
+        scan(projects_dir=Path(projects_dir), account="default")
+        return
+
+    cfg = load_config()
+    print(f"Config: {config_summary_line(cfg)}")
+    scan_all(cfg)
 
 
 def cmd_today():
