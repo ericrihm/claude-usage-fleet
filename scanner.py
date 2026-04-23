@@ -76,6 +76,53 @@ def init_db(conn):
                 f"ALTER TABLE {table} ADD COLUMN account TEXT NOT NULL DEFAULT 'default'"
             )
 
+    # The CREATE TABLE above declares session_id as the sole PK. For fresh multi-
+    # account installs, and for legacy installs being upgraded, we need the PK
+    # to be (account, session_id) so the same session_id can appear under two
+    # different profiles. SQLite can't redefine a PK in place — detect and
+    # recreate the sessions table once. Idempotent: skips if already migrated.
+    pk_cols = [
+        r[1] for r in conn.execute("PRAGMA table_info(sessions)").fetchall() if r[5] > 0
+    ]
+    if pk_cols == ["session_id"]:
+        conn.execute("BEGIN")
+        try:
+            conn.executescript("""
+                CREATE TABLE sessions_new (
+                    session_id      TEXT NOT NULL,
+                    project_name    TEXT,
+                    first_timestamp TEXT,
+                    last_timestamp  TEXT,
+                    git_branch      TEXT,
+                    total_input_tokens      INTEGER DEFAULT 0,
+                    total_output_tokens     INTEGER DEFAULT 0,
+                    total_cache_read        INTEGER DEFAULT 0,
+                    total_cache_creation    INTEGER DEFAULT 0,
+                    model           TEXT,
+                    turn_count      INTEGER DEFAULT 0,
+                    account         TEXT NOT NULL DEFAULT 'default',
+                    PRIMARY KEY (account, session_id)
+                );
+                INSERT INTO sessions_new
+                    (session_id, project_name, first_timestamp, last_timestamp,
+                     git_branch, total_input_tokens, total_output_tokens,
+                     total_cache_read, total_cache_creation, model, turn_count,
+                     account)
+                SELECT session_id, project_name, first_timestamp, last_timestamp,
+                       git_branch, total_input_tokens, total_output_tokens,
+                       total_cache_read, total_cache_creation, model, turn_count,
+                       COALESCE(account, 'default')
+                FROM sessions;
+                DROP TABLE sessions;
+                ALTER TABLE sessions_new RENAME TO sessions;
+                CREATE INDEX IF NOT EXISTS idx_sessions_first
+                    ON sessions(first_timestamp);
+            """)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
     # Account-scoped unique index for message_id: same API message won't be double-
     # inserted within one account, but two accounts that happen to share a file
     # (symlink, copy) each keep their own row.
@@ -88,11 +135,6 @@ def init_db(conn):
     # Indexes supporting per-account filtering in the dashboard.
     conn.execute("CREATE INDEX IF NOT EXISTS idx_turns_account ON turns(account)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_account ON sessions(account)")
-    # Composite unique constraint matches the logical PK (account, session_id).
-    conn.execute("""
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_account_session
-        ON sessions(account, session_id)
-    """)
     conn.commit()
 
 
