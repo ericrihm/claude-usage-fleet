@@ -248,6 +248,36 @@ class TestCheckAndFire(unittest.TestCase):
                 self.assertEqual(len(hook.received), 2)
                 self.assertEqual(hook.received[1]["payload"]["level"], "critical")
 
+    def test_no_subscribers_is_silent_not_phantom_retry(self):
+        """If no webhook subscribes to the crossed level, the state machine
+        should advance cleanly and stop logging 'alert (pending retries)'
+        on every subsequent run."""
+        with tempfile.TemporaryDirectory() as td:
+            dbp = Path(td) / "usage.db"
+            _seed_usage_above_warn(dbp, "acct1", "pro")
+            # All configured webhooks only want critical, but we're at warn.
+            cfg = {
+                "accounts": [{"name": "acct1", "path": str(td), "plan": "pro"}],
+                "thresholds": {"warn": 0.75, "critical": 0.95},
+                "webhooks": [{"url": "http://127.0.0.1:1/critical-only",
+                              "on": ["critical"]}],
+            }
+            fired_1 = alerts.check_and_fire(cfg, dbp, quiet=True)
+            fired_2 = alerts.check_and_fire(cfg, dbp, quiet=True)
+            self.assertEqual(fired_1, [], "phantom fire on first run")
+            self.assertEqual(fired_2, [], "phantom fire recurred — state didn't settle")
+
+            # And last_level should have advanced to 'warn' internally so
+            # a real critical crossing would still be detected as an upgrade.
+            conn = sqlite3.connect(dbp)
+            try:
+                level = conn.execute(
+                    "SELECT last_level FROM alert_state WHERE account = 'acct1'"
+                ).fetchone()
+            finally:
+                conn.close()
+            self.assertEqual(level[0], "warn")
+
     def test_api_plan_never_fires(self):
         with tempfile.TemporaryDirectory() as td:
             dbp = Path(td) / "usage.db"
