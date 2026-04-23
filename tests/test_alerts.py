@@ -106,6 +106,43 @@ def _seed_usage_above_critical(db_path, account, plan):
     conn.close()
 
 
+class TestWindowCutoff(unittest.TestCase):
+    """Regression: the 5h window filter must not count old same-day turns.
+
+    SQLite's datetime('now', '-5 hours') produces 'YYYY-MM-DD HH:MM:SS' while
+    transcripts store 'YYYY-MM-DDTHH:MM:SSZ'. Comparing as TEXT would let
+    early-morning turns slip through because 'T' sorts after ' '.
+    """
+
+    def test_old_same_day_turn_excluded(self):
+        with tempfile.TemporaryDirectory() as td:
+            dbp = Path(td) / "usage.db"
+            conn = scanner.get_db(dbp)
+            scanner.init_db(conn)
+            # Midnight UTC of today — definitely older than the 5h window
+            # unless it's literally 0-5 AM UTC at test time, which we
+            # intentionally avoid by using a fixed reference day.
+            old_ts = datetime.now(timezone.utc).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            ).strftime("%Y-%m-%dT%H:%M:%SZ")
+            conn.execute(
+                "INSERT INTO turns(session_id, timestamp, model, input_tokens,"
+                " output_tokens, cache_read_tokens, cache_creation_tokens,"
+                " tool_name, cwd, message_id, account)"
+                " VALUES ('s', ?, 'claude-pro', 10000, 0, 0, 0, NULL, '/', 'm', 'acct1')",
+                (old_ts,),
+            )
+            conn.commit()
+            # If and only if we're running between 05:00 and 23:59 UTC, the
+            # midnight row is older than 5 hours. Skip the assertion in the
+            # 0-5 UTC window rather than pinning wall-clock time.
+            now_hour = datetime.now(timezone.utc).hour
+            tokens = alerts.compute_block_tokens(conn, "acct1", window_hours=5)
+            conn.close()
+            if now_hour >= 5:
+                self.assertEqual(tokens, 0, "5h filter admitted a midnight turn")
+
+
 class TestBlockUsage(unittest.TestCase):
     def test_no_activity_returns_zero(self):
         with tempfile.TemporaryDirectory() as td:

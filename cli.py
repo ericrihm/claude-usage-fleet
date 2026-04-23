@@ -79,14 +79,25 @@ def require_db():
 def cmd_scan(projects_dir=None):
     """Scan all configured accounts (from accounts.json) into the shared DB.
 
-    If --projects-dir is given, bypasses the config and scans that one path
+    With no accounts.json present, preserves upstream behavior: scans every
+    default projects root (including the macOS Xcode integration directory)
+    under the 'default' account. Only the presence of accounts.json switches
+    the tool into strict multi-account mode.
+
+    If --projects-dir is given, bypasses everything and scans that one path
     under the 'default' account — handy for debugging or one-off imports.
     """
-    from scanner import scan, scan_all
-    from config import load_config, config_summary_line
+    from scanner import scan, scan_all, DEFAULT_PROJECTS_DIRS
+    from config import load_config, config_summary_line, DEFAULT_CONFIG_PATH
 
     if projects_dir:
         scan(projects_dir=Path(projects_dir), account="default")
+        return
+
+    if not DEFAULT_CONFIG_PATH.exists():
+        # Single-account fallback. Use upstream's DEFAULT_PROJECTS_DIRS so the
+        # Xcode integration path isn't silently dropped.
+        scan(projects_dirs=DEFAULT_PROJECTS_DIRS, account="default")
         return
 
     cfg = load_config()
@@ -114,7 +125,7 @@ def cmd_today():
     """, (today,)).fetchall()
 
     sessions = conn.execute("""
-        SELECT COUNT(DISTINCT session_id) as cnt
+        SELECT COUNT(DISTINCT account || '|' || session_id) as cnt
         FROM turns
         WHERE substr(timestamp, 1, 10) = ?
     """, (today,)).fetchone()
@@ -186,22 +197,25 @@ def cmd_stats():
             SUM(cache_read_tokens)     as cr,
             SUM(cache_creation_tokens) as cc,
             COUNT(*)                   as turns,
-            COUNT(DISTINCT session_id) as sessions
+            COUNT(DISTINCT account || '|' || session_id) as sessions
         FROM turns
         GROUP BY model
         ORDER BY inp + out DESC
     """).fetchall()
 
-    # Top 5 projects from turns (join with sessions for project name)
+    # Top 5 projects from turns (join with sessions for project name).
+    # Since session_id can now repeat across accounts, the join must key on
+    # (session_id, account) to avoid Cartesian products on shared IDs.
     top_projects = conn.execute("""
         SELECT
             COALESCE(s.project_name, 'unknown') as project_name,
             SUM(t.input_tokens)  as inp,
             SUM(t.output_tokens) as out,
             COUNT(*)             as turns,
-            COUNT(DISTINCT t.session_id) as sessions
+            COUNT(DISTINCT t.account || '|' || t.session_id) as sessions
         FROM turns t
-        LEFT JOIN sessions s ON t.session_id = s.session_id
+        LEFT JOIN sessions s
+            ON t.session_id = s.session_id AND t.account = s.account
         GROUP BY s.project_name
         ORDER BY inp + out DESC
         LIMIT 5
