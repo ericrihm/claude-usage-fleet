@@ -3,3 +3,7 @@ server.log
 accounts.json
 *.db
 .claude/
+
+# AI assistant config
+CLAUDE.md
+.claude/
