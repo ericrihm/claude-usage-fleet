@@ -8,28 +8,44 @@ import sqlite3
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from datetime import datetime
+from urllib.parse import urlsplit, parse_qs
 
 DB_PATH = Path.home() / ".claude" / "usage.db"
 
 
-def get_dashboard_data(db_path=DB_PATH):
+def _account_filter(account):
+    """Build a (clause, params) tuple for an optional account filter.
+
+    account=None or 'all' means no filter (returns empty clause).
+    """
+    if not account or account == "all":
+        return "", ()
+    return "account = ?", (account,)
+
+
+def get_dashboard_data(db_path=DB_PATH, account=None):
     if not db_path.exists():
         return {"error": "Database not found. Run: python cli.py scan"}
 
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
 
+    where, params = _account_filter(account)
+    turns_where = f"WHERE {where}" if where else ""
+    sessions_where = f"WHERE {where}" if where else ""
+
     # ── All models (for filter UI) ────────────────────────────────────────────
-    model_rows = conn.execute("""
+    model_rows = conn.execute(f"""
         SELECT COALESCE(model, 'unknown') as model
         FROM turns
+        {turns_where}
         GROUP BY model
         ORDER BY SUM(input_tokens + output_tokens) DESC
-    """).fetchall()
+    """, params).fetchall()
     all_models = [r["model"] for r in model_rows]
 
     # ── Daily per-model, ALL history (client filters by range) ────────────────
-    daily_rows = conn.execute("""
+    daily_rows = conn.execute(f"""
         SELECT
             substr(timestamp, 1, 10)   as day,
             COALESCE(model, 'unknown') as model,
@@ -39,9 +55,10 @@ def get_dashboard_data(db_path=DB_PATH):
             SUM(cache_creation_tokens) as cache_creation,
             COUNT(*)                   as turns
         FROM turns
+        {turns_where}
         GROUP BY day, model
         ORDER BY day, model
-    """).fetchall()
+    """, params).fetchall()
 
     daily_by_model = [{
         "day":            r["day"],
@@ -54,14 +71,16 @@ def get_dashboard_data(db_path=DB_PATH):
     } for r in daily_rows]
 
     # ── All sessions (client filters by range and model) ──────────────────────
-    session_rows = conn.execute("""
+    session_rows = conn.execute(f"""
         SELECT
             session_id, project_name, first_timestamp, last_timestamp,
             total_input_tokens, total_output_tokens,
-            total_cache_read, total_cache_creation, model, turn_count
+            total_cache_read, total_cache_creation, model, turn_count,
+            account
         FROM sessions
+        {sessions_where}
         ORDER BY last_timestamp DESC
-    """).fetchall()
+    """, params).fetchall()
 
     sessions_all = []
     for r in session_rows:
@@ -83,6 +102,7 @@ def get_dashboard_data(db_path=DB_PATH):
             "output":        r["total_output_tokens"] or 0,
             "cache_read":    r["total_cache_read"] or 0,
             "cache_creation": r["total_cache_creation"] or 0,
+            "account":       r["account"] or "default",
         })
 
     conn.close()
@@ -91,8 +111,147 @@ def get_dashboard_data(db_path=DB_PATH):
         "all_models":     all_models,
         "daily_by_model": daily_by_model,
         "sessions_all":   sessions_all,
+        "account":        account or "all",
         "generated_at":   datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
+
+
+def get_accounts_list(db_path=DB_PATH):
+    """Return the union of (a) accounts seen in the DB and (b) accounts defined
+    in accounts.json. Accounts with no activity yet still show up so the UI can
+    render a progress bar at 0%.
+    """
+    from config import load_config
+
+    names = []
+    if db_path.exists():
+        conn = sqlite3.connect(db_path)
+        try:
+            names = [
+                r[0] for r in conn.execute(
+                    "SELECT DISTINCT account FROM sessions ORDER BY account"
+                ).fetchall()
+            ]
+        finally:
+            conn.close()
+
+    try:
+        cfg = load_config(quiet=True)
+        for a in cfg["accounts"]:
+            if a["name"] not in names:
+                names.append(a["name"])
+    except Exception:
+        pass
+
+    return names
+
+
+def get_compare_data(db_path=DB_PATH, window="5h"):
+    """Per-account usage within a rolling window.
+
+    Windows: '5h' -> 5 hours, '24h' -> 24 hours, '7d' -> 7 days.
+    Returns one row per configured account (zero-filled) plus any ad-hoc accounts
+    found in the DB that aren't in the config.
+    """
+    from config import load_config
+
+    hours = {"5h": 5, "24h": 24, "7d": 24 * 7}.get(window, 5)
+
+    try:
+        cfg = load_config(quiet=True)
+    except Exception:
+        cfg = {"accounts": []}
+
+    configured = [a["name"] for a in cfg["accounts"]]
+
+    if not db_path.exists():
+        return [{"account": n, "input": 0, "output": 0, "cache_read": 0,
+                 "cache_creation": 0, "turns": 0, "sessions": 0} for n in configured]
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(f"""
+            SELECT
+                account,
+                SUM(input_tokens)           as input,
+                SUM(output_tokens)          as output,
+                SUM(cache_read_tokens)      as cache_read,
+                SUM(cache_creation_tokens)  as cache_creation,
+                COUNT(*)                    as turns,
+                COUNT(DISTINCT session_id)  as sessions
+            FROM turns
+            WHERE timestamp >= datetime('now', ?)
+            GROUP BY account
+        """, (f'-{hours} hours',)).fetchall()
+    finally:
+        conn.close()
+
+    by_account = {r["account"]: r for r in rows}
+    names = list(configured)
+    for n in by_account:
+        if n not in names:
+            names.append(n)
+
+    out = []
+    for n in names:
+        r = by_account.get(n)
+        out.append({
+            "account":        n,
+            "input":          (r["input"] if r else 0) or 0,
+            "output":         (r["output"] if r else 0) or 0,
+            "cache_read":     (r["cache_read"] if r else 0) or 0,
+            "cache_creation": (r["cache_creation"] if r else 0) or 0,
+            "turns":          (r["turns"] if r else 0) or 0,
+            "sessions":       (r["sessions"] if r else 0) or 0,
+        })
+    return out
+
+
+def get_header_strip(db_path=DB_PATH):
+    """Data for the per-account progress-bar strip in the header.
+
+    For each configured account: its plan, its 5h token usage, its plan limit,
+    and the resulting usage fraction. Accounts without a plan (or plan='api')
+    come back with limit=None so the UI can render them as informational only.
+    """
+    from alerts import PLAN_LIMITS, compute_block_tokens  # noqa: F401
+    from config import load_config
+
+    try:
+        cfg = load_config(quiet=True)
+    except Exception:
+        cfg = {"accounts": [], "thresholds": {"warn": 0.75, "critical": 0.95}}
+
+    thresholds = cfg["thresholds"]
+    result = {
+        "thresholds": thresholds,
+        "accounts": [],
+    }
+
+    if not db_path.exists():
+        for a in cfg["accounts"]:
+            result["accounts"].append({
+                "account": a["name"], "plan": a.get("plan"),
+                "tokens": 0, "limit": PLAN_LIMITS.get(a.get("plan")),
+                "fraction": 0.0,
+            })
+        return result
+
+    conn = sqlite3.connect(db_path)
+    try:
+        for a in cfg["accounts"]:
+            plan = a.get("plan")
+            limit = PLAN_LIMITS.get(plan)
+            tokens = compute_block_tokens(conn, a["name"])
+            fraction = (tokens / limit) if limit else 0.0
+            result["accounts"].append({
+                "account": a["name"], "plan": plan, "tokens": tokens,
+                "limit": limit, "fraction": fraction,
+            })
+    finally:
+        conn.close()
+    return result
 
 
 HTML_TEMPLATE = r"""<!DOCTYPE html>
@@ -181,6 +340,31 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .footer-content a:hover { text-decoration: underline; }
 
   @media (max-width: 768px) { .charts-grid { grid-template-columns: 1fr; } .chart-card.wide { grid-column: 1; } }
+
+  /* ── Multi-account additions ──────────────────────────────────────────── */
+  #account-strip { background: var(--card); border-bottom: 1px solid var(--border); padding: 12px 24px; display: flex; gap: 14px; flex-wrap: wrap; }
+  #account-strip:empty { display: none; }
+  .acct-pill { min-width: 160px; flex: 1 1 180px; background: rgba(255,255,255,0.02); border: 1px solid var(--border); border-radius: 6px; padding: 8px 12px; }
+  .acct-pill .acct-name { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); display: flex; justify-content: space-between; margin-bottom: 5px; }
+  .acct-pill .acct-plan { font-weight: 400; font-size: 10px; opacity: 0.8; }
+  .acct-bar { height: 8px; background: #242835; border-radius: 4px; overflow: hidden; position: relative; }
+  .acct-bar-fill { height: 100%; transition: width 0.3s ease, background 0.3s ease; }
+  .acct-bar-fill.ok   { background: var(--green); }
+  .acct-bar-fill.warn { background: #facc15; }
+  .acct-bar-fill.crit { background: #f87171; }
+  .acct-pill .acct-usage { font-size: 11px; color: var(--muted); margin-top: 4px; display: flex; justify-content: space-between; }
+
+  #account-select { background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 4px 10px; font-size: 12px; cursor: pointer; }
+  #account-select:hover { border-color: var(--accent); }
+
+  .tabs { display: flex; gap: 4px; margin-bottom: 16px; border-bottom: 1px solid var(--border); }
+  .tab-btn { padding: 10px 18px; background: transparent; border: none; border-bottom: 2px solid transparent; color: var(--muted); cursor: pointer; font-size: 13px; font-weight: 500; }
+  .tab-btn:hover { color: var(--text); }
+  .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
+  .tab-panel { display: none; }
+  .tab-panel.active { display: block; }
+  #compare-window { display: inline-flex; gap: 0; margin-left: 12px; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; vertical-align: middle; }
+  #compare-window .range-btn { padding: 3px 10px; font-size: 11px; }
 </style>
 </head>
 <body>
@@ -190,7 +374,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <button id="rescan-btn" onclick="triggerRescan()" title="Rebuild the database from scratch by re-scanning all JSONL files. Use if data looks stale or costs seem wrong.">&#x21bb; Rescan</button>
 </header>
 
+<div id="account-strip"></div>
+
 <div id="filter-bar">
+  <div class="filter-label">Account</div>
+  <select id="account-select" onchange="setAccount(this.value)">
+    <option value="all">All accounts</option>
+  </select>
+  <div class="filter-sep"></div>
   <div class="filter-label">Models</div>
   <div id="model-checkboxes"></div>
   <button class="filter-btn" onclick="selectAllModels()">All</button>
@@ -206,6 +397,42 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 </div>
 
 <div class="container">
+  <div class="tabs">
+    <button class="tab-btn active" data-tab="overview" onclick="setTab('overview')">Overview</button>
+    <button class="tab-btn" data-tab="compare" onclick="setTab('compare')">Compare Accounts</button>
+  </div>
+
+  <div id="tab-compare" class="tab-panel">
+    <div class="chart-card wide">
+      <h2>
+        Compare Accounts
+        <span id="compare-window">
+          <button class="range-btn active" data-window="5h"  onclick="setCompareWindow('5h')">5h</button>
+          <button class="range-btn"        data-window="24h" onclick="setCompareWindow('24h')">24h</button>
+          <button class="range-btn"        data-window="7d"  onclick="setCompareWindow('7d')">7d</button>
+        </span>
+      </h2>
+      <div class="chart-wrap tall"><canvas id="chart-compare"></canvas></div>
+    </div>
+    <div class="table-card">
+      <div class="section-title">Per-account totals</div>
+      <table>
+        <thead><tr>
+          <th>Account</th>
+          <th>Sessions</th>
+          <th>Turns</th>
+          <th>Input</th>
+          <th>Output</th>
+          <th>Cache Read</th>
+          <th>Cache Creation</th>
+          <th>Est. Cost</th>
+        </tr></thead>
+        <tbody id="compare-body"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div id="tab-overview" class="tab-panel active">
   <div class="stats-row" id="stats-row"></div>
   <div class="charts-grid">
     <div class="chart-card wide">
@@ -267,6 +494,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <tbody id="project-cost-body"></tbody>
     </table>
   </div>
+  </div> <!-- /tab-overview -->
 </div>
 
 <footer>
@@ -294,6 +522,9 @@ function esc(s) {
 let rawData = null;
 let selectedModels = new Set();
 let selectedRange = '30d';
+let selectedAccount = 'all';
+let currentTab = 'overview';
+let compareWindow = '5h';
 let charts = {};
 let sessionSortCol = 'last';
 let modelSortCol = 'cost';
@@ -456,8 +687,157 @@ function updateURL() {
   const params = new URLSearchParams();
   if (selectedRange !== '30d') params.set('range', selectedRange);
   if (!isDefaultModelSelection(allModels)) params.set('models', Array.from(selectedModels).join(','));
+  if (selectedAccount && selectedAccount !== 'all') params.set('account', selectedAccount);
+  if (currentTab !== 'overview') params.set('tab', currentTab);
   const search = params.toString() ? '?' + params.toString() : '';
   history.replaceState(null, '', window.location.pathname + search);
+}
+
+function readURLAccount() {
+  return new URLSearchParams(window.location.search).get('account') || 'all';
+}
+function readURLTab() {
+  const t = new URLSearchParams(window.location.search).get('tab');
+  return t === 'compare' ? 'compare' : 'overview';
+}
+
+// ── Account filter ─────────────────────────────────────────────────────────
+function setAccount(name) {
+  selectedAccount = name || 'all';
+  rawData = null;                  // force full refresh under new filter
+  updateURL();
+  loadData();
+  if (currentTab === 'compare') loadCompare();
+  loadHeaderStrip();               // strip always reflects all accounts
+}
+
+async function loadAccountList() {
+  try {
+    const resp = await fetch('/api/accounts');
+    const d = await resp.json();
+    const sel = document.getElementById('account-select');
+    // Keep the "All accounts" entry and append each account.
+    while (sel.options.length > 1) sel.remove(1);
+    for (const name of (d.accounts || [])) {
+      const opt = document.createElement('option');
+      opt.value = name; opt.textContent = name;
+      sel.appendChild(opt);
+    }
+    sel.value = selectedAccount;
+  } catch(e) { console.error('account list', e); }
+}
+
+// ── Header progress strip ──────────────────────────────────────────────────
+async function loadHeaderStrip() {
+  try {
+    const resp = await fetch('/api/header-strip');
+    const d = await resp.json();
+    const strip = document.getElementById('account-strip');
+    if (!d.accounts || d.accounts.length === 0) { strip.innerHTML = ''; return; }
+    const warn = d.thresholds.warn, crit = d.thresholds.critical;
+    strip.innerHTML = d.accounts.map(a => {
+      const hasLimit = a.limit != null;
+      const frac = Math.max(0, Math.min(1, a.fraction || 0));
+      const pct = hasLimit ? (frac * 100).toFixed(0) : '--';
+      let cls = 'ok';
+      if (hasLimit && frac >= crit) cls = 'crit';
+      else if (hasLimit && frac >= warn) cls = 'warn';
+      const widthStyle = hasLimit ? 'width:' + (frac * 100).toFixed(1) + '%' : 'width:0%';
+      const planLabel = a.plan ? a.plan : 'no plan';
+      const usageLabel = hasLimit
+        ? (a.tokens.toLocaleString() + ' / ' + a.limit.toLocaleString() + ' · ' + pct + '%')
+        : (a.tokens.toLocaleString() + ' tokens (5h)');
+      return '<div class="acct-pill" onclick="setAccountFromPill(' + JSON.stringify(a.account).replace(/"/g, '&quot;') + ')" style="cursor:pointer">'
+        +   '<div class="acct-name"><span>' + esc(a.account) + '</span><span class="acct-plan">' + esc(planLabel) + '</span></div>'
+        +   '<div class="acct-bar"><div class="acct-bar-fill ' + cls + '" style="' + widthStyle + '"></div></div>'
+        +   '<div class="acct-usage"><span>' + esc(usageLabel) + '</span><span>5h block</span></div>'
+        + '</div>';
+    }).join('');
+  } catch(e) { console.error('header strip', e); }
+}
+
+function setAccountFromPill(name) {
+  const sel = document.getElementById('account-select');
+  sel.value = name;
+  setAccount(name);
+}
+
+// ── Tabs ───────────────────────────────────────────────────────────────────
+function setTab(name) {
+  currentTab = name;
+  document.querySelectorAll('.tab-btn').forEach(b =>
+    b.classList.toggle('active', b.dataset.tab === name));
+  document.querySelectorAll('.tab-panel').forEach(p =>
+    p.classList.toggle('active', p.id === 'tab-' + name));
+  updateURL();
+  if (name === 'compare') loadCompare();
+}
+
+function setCompareWindow(w) {
+  compareWindow = w;
+  document.querySelectorAll('#compare-window .range-btn').forEach(b =>
+    b.classList.toggle('active', b.dataset.window === w));
+  loadCompare();
+}
+
+async function loadCompare() {
+  try {
+    const resp = await fetch('/api/compare?window=' + encodeURIComponent(compareWindow));
+    const d = await resp.json();
+    const rows = d.rows || [];
+    const labels = rows.map(r => r.account);
+    const inputs = rows.map(r => r.input);
+    const outputs = rows.map(r => r.output);
+    const cacheR = rows.map(r => r.cache_read);
+    const cacheC = rows.map(r => r.cache_creation);
+
+    const ctx = document.getElementById('chart-compare').getContext('2d');
+    if (charts.compare) charts.compare.destroy();
+    charts.compare = new Chart(ctx, {
+      type: 'bar',
+      data: {
+        labels: labels,
+        datasets: [
+          { label: 'Input',          data: inputs,  backgroundColor: '#4f8ef7' },
+          { label: 'Output',         data: outputs, backgroundColor: '#d97757' },
+          { label: 'Cache Read',     data: cacheR,  backgroundColor: '#4ade80' },
+          { label: 'Cache Creation', data: cacheC,  backgroundColor: '#facc15' },
+        ],
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        plugins: { legend: { labels: { color: '#e2e8f0' } } },
+        scales: {
+          x: { stacked: true, ticks: { color: '#8892a4' }, grid: { color: '#2a2d3a' } },
+          y: { stacked: true, ticks: { color: '#8892a4' }, grid: { color: '#2a2d3a' } },
+        },
+      },
+    });
+
+    // Fill the totals table.
+    const tb = document.getElementById('compare-body');
+    tb.innerHTML = rows.map(r => {
+      // Cost approximation uses a Sonnet price as a middle-ground proxy —
+      // real cost depends on per-model mix which isn't in the compare payload.
+      const sonnet = PRICING['claude-sonnet-4-6'];
+      const cost = (
+        r.input          * sonnet.input       / 1e6 +
+        r.output         * sonnet.output      / 1e6 +
+        r.cache_read     * sonnet.cache_read  / 1e6 +
+        r.cache_creation * sonnet.cache_write / 1e6
+      );
+      return '<tr>'
+        + '<td>' + esc(r.account) + '</td>'
+        + '<td class="num">' + (r.sessions || 0) + '</td>'
+        + '<td class="num">' + (r.turns || 0) + '</td>'
+        + '<td class="num">' + fmt(r.input) + '</td>'
+        + '<td class="num">' + fmt(r.output) + '</td>'
+        + '<td class="num">' + fmt(r.cache_read) + '</td>'
+        + '<td class="num">' + fmt(r.cache_creation) + '</td>'
+        + '<td class="cost">$' + cost.toFixed(4) + '</td>'
+        + '</tr>';
+    }).join('');
+  } catch(e) { console.error('compare', e); }
 }
 
 // ── Session sort ───────────────────────────────────────────────────────────
@@ -852,13 +1232,17 @@ async function triggerRescan() {
 // ── Data loading ───────────────────────────────────────────────────────────
 async function loadData() {
   try {
-    const resp = await fetch('/api/data');
+    const url = '/api/data'
+      + (selectedAccount && selectedAccount !== 'all'
+          ? '?account=' + encodeURIComponent(selectedAccount) : '');
+    const resp = await fetch(url);
     const d = await resp.json();
     if (d.error) {
       document.body.innerHTML = '<div style="padding:40px;color:#f87171">' + esc(d.error) + '</div>';
       return;
     }
-    document.getElementById('meta').textContent = 'Updated: ' + d.generated_at + ' \u00b7 Auto-refresh in 30s';
+    const acctLabel = selectedAccount === 'all' ? 'all accounts' : selectedAccount;
+    document.getElementById('meta').textContent = 'Updated: ' + d.generated_at + ' \u00b7 ' + acctLabel + ' \u00b7 Auto-refresh in 30s';
 
     const isFirstLoad = rawData === null;
     rawData = d;
@@ -882,8 +1266,17 @@ async function loadData() {
   }
 }
 
-loadData();
-setInterval(loadData, 30000);
+async function initialLoad() {
+  selectedAccount = readURLAccount();
+  currentTab = readURLTab();
+  setTab(currentTab);
+  await loadAccountList();
+  document.getElementById('account-select').value = selectedAccount;
+  await Promise.all([loadData(), loadHeaderStrip()]);
+}
+
+initialLoad();
+setInterval(() => { loadData(); loadHeaderStrip(); }, 30000);
 </script>
 </body>
 </html>
@@ -894,39 +1287,105 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
+    def _json(self, data, status=200):
+        body = json.dumps(data).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _qs(self):
+        return parse_qs(urlsplit(self.path).query)
+
     def do_GET(self):
-        if self.path in ("/", "/index.html"):
+        split = urlsplit(self.path)
+        route = split.path
+        qs = parse_qs(split.query)
+
+        if route in ("/", "/index.html"):
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
             self.wfile.write(HTML_TEMPLATE.encode("utf-8"))
+            return
 
-        elif self.path == "/api/data":
-            data = get_dashboard_data()
-            body = json.dumps(data).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+        if route == "/api/data":
+            account = (qs.get("account") or [None])[0]
+            # Auto-refresh is the natural cadence for alert polling — one query
+            # per account, cheap. Errors shouldn't break the dashboard.
+            try:
+                from config import load_config
+                from alerts import check_and_fire
+                cfg = load_config(quiet=True)
+                if cfg["webhooks"]:
+                    check_and_fire(cfg, DB_PATH, quiet=True)
+            except Exception:
+                pass
+            self._json(get_dashboard_data(account=account))
+            return
 
-        else:
-            self.send_response(404)
-            self.end_headers()
+        if route == "/api/accounts":
+            self._json({"accounts": get_accounts_list()})
+            return
+
+        if route == "/api/compare":
+            window = (qs.get("window") or ["5h"])[0]
+            if window not in ("5h", "24h", "7d"):
+                self._json({"error": "window must be 5h, 24h, or 7d"}, status=400)
+                return
+            self._json({"window": window, "rows": get_compare_data(window=window)})
+            return
+
+        if route == "/api/header-strip":
+            self._json(get_header_strip())
+            return
+
+        if route == "/api/alerts/test":
+            account = (qs.get("account") or [None])[0]
+            level = (qs.get("level") or ["warn"])[0]
+            if not account or level not in ("warn", "critical"):
+                self._json({"error": "need account=<name>&level=warn|critical"}, status=400)
+                return
+            try:
+                from config import load_config
+                from alerts import fire_test
+                cfg = load_config(quiet=True)
+            except Exception as e:
+                self._json({"error": str(e)}, status=500)
+                return
+            payload, results = fire_test(cfg, DB_PATH, account, level)
+            self._json({"payload": payload, "results": results})
+            return
+
+        self.send_response(404)
+        self.end_headers()
 
     def do_POST(self):
         if self.path == "/api/rescan":
-            # Full rebuild: delete DB and rescan from scratch
+            # Full rebuild: delete DB and rescan every configured account.
             if DB_PATH.exists():
                 DB_PATH.unlink()
-            from scanner import scan
-            result = scan(verbose=False)
-            body = json.dumps(result).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            try:
+                from config import load_config
+                from scanner import scan_all
+                cfg = load_config(quiet=True)
+                rows = scan_all(cfg, verbose=False)
+                # Aggregate across accounts for a stable response shape that
+                # keeps upstream's {new, updated, skipped, turns} keys.
+                agg = {"new": 0, "updated": 0, "skipped": 0, "turns": 0}
+                per_account = []
+                for name, new, upd, skip, turns in rows:
+                    agg["new"] += new
+                    agg["updated"] += upd
+                    agg["skipped"] += skip
+                    agg["turns"] += turns
+                    per_account.append({"account": name, "new": new,
+                                         "updated": upd, "skipped": skip, "turns": turns})
+                agg["accounts"] = per_account
+                self._json(agg)
+            except Exception as e:
+                self._json({"ok": False, "error": str(e)}, status=500)
         else:
             self.send_response(404)
             self.end_headers()
