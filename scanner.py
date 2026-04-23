@@ -66,10 +66,32 @@ def init_db(conn):
         conn.execute("SELECT message_id FROM turns LIMIT 1")
     except sqlite3.OperationalError:
         conn.execute("ALTER TABLE turns ADD COLUMN message_id TEXT")
-    # Conditional unique index: only dedup non-null message IDs
+
+    # Multi-account migration: add `account` column to sessions and turns.
+    # Existing rows are backfilled to 'default' so single-account installs keep working.
+    for table in ("sessions", "turns"):
+        cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+        if "account" not in cols:
+            conn.execute(
+                f"ALTER TABLE {table} ADD COLUMN account TEXT NOT NULL DEFAULT 'default'"
+            )
+
+    # Account-scoped unique index for message_id: same API message won't be double-
+    # inserted within one account, but two accounts that happen to share a file
+    # (symlink, copy) each keep their own row.
+    conn.execute("DROP INDEX IF EXISTS idx_turns_message_id")
     conn.execute("""
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_turns_message_id
-        ON turns(message_id) WHERE message_id IS NOT NULL AND message_id != ''
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_turns_account_message_id
+        ON turns(account, message_id) WHERE message_id IS NOT NULL AND message_id != ''
+    """)
+
+    # Indexes supporting per-account filtering in the dashboard.
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_turns_account ON turns(account)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_account ON sessions(account)")
+    # Composite unique constraint matches the logical PK (account, session_id).
+    conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_account_session
+        ON sessions(account, session_id)
     """)
     conn.commit()
 
@@ -190,8 +212,11 @@ def parse_jsonl_file(filepath):
     return list(session_meta.values()), turns, line_count
 
 
-def aggregate_sessions(session_metas, turns):
-    """Aggregate turn data back into session-level stats."""
+def aggregate_sessions(session_metas, turns, account="default"):
+    """Aggregate turn data back into session-level stats.
+
+    account is attached to every returned session so the caller can persist it.
+    """
     from collections import defaultdict
 
     session_stats = defaultdict(lambda: {
@@ -218,17 +243,19 @@ def aggregate_sessions(session_metas, turns):
     for meta in session_metas:
         sid = meta["session_id"]
         stats = session_stats[sid]
-        result.append({**meta, **stats})
+        result.append({**meta, **stats, "account": account})
     return result
 
 
-def upsert_sessions(conn, sessions):
+def upsert_sessions(conn, sessions, account="default"):
     for s in sessions:
-        # Check if session exists
+        acct = s.get("account", account)
+        # Check if session exists *for this account*. Same session_id under a
+        # different account is a distinct row.
         existing = conn.execute(
-            "SELECT total_input_tokens, total_output_tokens, total_cache_read, "
-            "total_cache_creation, turn_count FROM sessions WHERE session_id = ?",
-            (s["session_id"],)
+            "SELECT total_input_tokens FROM sessions "
+            "WHERE session_id = ? AND account = ?",
+            (s["session_id"], acct)
         ).fetchone()
 
         if existing is None:
@@ -236,14 +263,15 @@ def upsert_sessions(conn, sessions):
                 INSERT INTO sessions
                     (session_id, project_name, first_timestamp, last_timestamp,
                      git_branch, total_input_tokens, total_output_tokens,
-                     total_cache_read, total_cache_creation, model, turn_count)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     total_cache_read, total_cache_creation, model, turn_count,
+                     account)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 s["session_id"], s["project_name"], s["first_timestamp"],
                 s["last_timestamp"], s["git_branch"],
                 s["total_input_tokens"], s["total_output_tokens"],
                 s["total_cache_read"], s["total_cache_creation"],
-                s["model"], s["turn_count"]
+                s["model"], s["turn_count"], acct,
             ))
         else:
             # Update: add new tokens on top of existing (since we only insert new turns)
@@ -256,34 +284,43 @@ def upsert_sessions(conn, sessions):
                     total_cache_creation = total_cache_creation + ?,
                     turn_count = turn_count + ?,
                     model = COALESCE(?, model)
-                WHERE session_id = ?
+                WHERE session_id = ? AND account = ?
             """, (
                 s["last_timestamp"],
                 s["total_input_tokens"], s["total_output_tokens"],
                 s["total_cache_read"], s["total_cache_creation"],
                 s["turn_count"], s["model"],
-                s["session_id"]
+                s["session_id"], acct,
             ))
 
 
-def insert_turns(conn, turns):
+def insert_turns(conn, turns, account="default"):
     conn.executemany("""
         INSERT OR IGNORE INTO turns
             (session_id, timestamp, model, input_tokens, output_tokens,
-             cache_read_tokens, cache_creation_tokens, tool_name, cwd, message_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             cache_read_tokens, cache_creation_tokens, tool_name, cwd,
+             message_id, account)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, [
         (t["session_id"], t["timestamp"], t["model"],
          t["input_tokens"], t["output_tokens"],
          t["cache_read_tokens"], t["cache_creation_tokens"],
-         t["tool_name"], t["cwd"], t.get("message_id", ""))
+         t["tool_name"], t["cwd"], t.get("message_id", ""),
+         t.get("account", account))
         for t in turns
     ])
 
 
-def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
-    conn = get_db(db_path)
-    init_db(conn)
+def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True,
+         account="default", _conn=None):
+    """Scan a single account's JSONL tree. Pass `account` to tag all rows.
+
+    When `_conn` is provided, scan reuses that connection (and does not close it).
+    Used by scan_all() to keep all accounts in one transaction.
+    """
+    conn = _conn if _conn is not None else get_db(db_path)
+    if _conn is None:
+        init_db(conn)
 
     if projects_dirs:
         dirs_to_scan = [Path(d) for d in projects_dirs]
@@ -332,9 +369,11 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
             session_metas, turns, line_count = parse_jsonl_file(filepath)
 
             if turns or session_metas:
-                sessions = aggregate_sessions(session_metas, turns)
-                upsert_sessions(conn, sessions)
-                insert_turns(conn, turns)
+                for t in turns:
+                    t["account"] = account
+                sessions = aggregate_sessions(session_metas, turns, account=account)
+                upsert_sessions(conn, sessions, account=account)
+                insert_turns(conn, turns, account=account)
                 for s in sessions:
                     total_sessions.add(s["session_id"])
                 total_turns += len(turns)
@@ -441,9 +480,13 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
             new_turns = turns_no_id + list(seen_messages.values())
 
             if new_turns or new_session_metas:
-                sessions = aggregate_sessions(list(new_session_metas.values()), new_turns)
-                upsert_sessions(conn, sessions)
-                insert_turns(conn, new_turns)
+                for t in new_turns:
+                    t["account"] = account
+                sessions = aggregate_sessions(
+                    list(new_session_metas.values()), new_turns, account=account,
+                )
+                upsert_sessions(conn, sessions, account=account)
+                insert_turns(conn, new_turns, account=account)
                 for s in sessions:
                     total_sessions.add(s["session_id"])
                 total_turns += len(new_turns)
@@ -459,28 +502,80 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
     # Recompute session totals from actual turns in DB.
     # This ensures correctness when INSERT OR IGNORE skips duplicate turns
     # but upsert_sessions had already added their tokens additively.
+    # Scoped to this account so concurrent scans on other accounts aren't touched.
     if new_files or updated_files:
         conn.execute("""
             UPDATE sessions SET
-                total_input_tokens = COALESCE((SELECT SUM(input_tokens) FROM turns WHERE turns.session_id = sessions.session_id), 0),
-                total_output_tokens = COALESCE((SELECT SUM(output_tokens) FROM turns WHERE turns.session_id = sessions.session_id), 0),
-                total_cache_read = COALESCE((SELECT SUM(cache_read_tokens) FROM turns WHERE turns.session_id = sessions.session_id), 0),
-                total_cache_creation = COALESCE((SELECT SUM(cache_creation_tokens) FROM turns WHERE turns.session_id = sessions.session_id), 0),
-                turn_count = COALESCE((SELECT COUNT(*) FROM turns WHERE turns.session_id = sessions.session_id), 0)
-        """)
+                total_input_tokens = COALESCE((SELECT SUM(input_tokens) FROM turns WHERE turns.session_id = sessions.session_id AND turns.account = sessions.account), 0),
+                total_output_tokens = COALESCE((SELECT SUM(output_tokens) FROM turns WHERE turns.session_id = sessions.session_id AND turns.account = sessions.account), 0),
+                total_cache_read = COALESCE((SELECT SUM(cache_read_tokens) FROM turns WHERE turns.session_id = sessions.session_id AND turns.account = sessions.account), 0),
+                total_cache_creation = COALESCE((SELECT SUM(cache_creation_tokens) FROM turns WHERE turns.session_id = sessions.session_id AND turns.account = sessions.account), 0),
+                turn_count = COALESCE((SELECT COUNT(*) FROM turns WHERE turns.session_id = sessions.session_id AND turns.account = sessions.account), 0)
+            WHERE account = ?
+        """, (account,))
         conn.commit()
 
     if verbose:
-        print(f"\nScan complete:")
+        print(f"\nScan complete for account {account!r}:")
         print(f"  New files:     {new_files}")
         print(f"  Updated files: {updated_files}")
         print(f"  Skipped files: {skipped_files}")
         print(f"  Turns added:   {total_turns}")
         print(f"  Sessions seen: {len(total_sessions)}")
 
-    conn.close()
+    if _conn is None:
+        conn.close()
     return {"new": new_files, "updated": updated_files, "skipped": skipped_files,
-            "turns": total_turns, "sessions": len(total_sessions)}
+            "turns": total_turns, "sessions": len(total_sessions),
+            "account": account}
+
+
+def scan_all(config, db_path=DB_PATH, verbose=True):
+    """Scan every account in `config["accounts"]` into one shared DB.
+
+    Prints a summary table at the end. Paths are asserted disjoint to prevent
+    processed_files.path collisions across accounts.
+    """
+    conn = get_db(db_path)
+    init_db(conn)
+
+    paths_seen = set()
+    for acct in config["accounts"]:
+        resolved = str(Path(acct["path"]).expanduser().resolve())
+        assert resolved not in paths_seen, (
+            f"Configured account paths must be disjoint; {acct['name']!r} -> "
+            f"{resolved} was already claimed by another account"
+        )
+        paths_seen.add(resolved)
+
+    rows = []
+    for acct in config["accounts"]:
+        projects_dir = Path(acct["path"]).expanduser() / "projects"
+        if not projects_dir.exists():
+            if verbose:
+                print(f"  [SKIP] {acct['name']}: {projects_dir} does not exist")
+            rows.append((acct["name"], 0, 0, 0, 0))
+            continue
+        result = scan(
+            projects_dir=projects_dir,
+            db_path=db_path,
+            verbose=verbose,
+            account=acct["name"],
+            _conn=conn,
+        )
+        rows.append((acct["name"], result["new"], result["updated"],
+                     result["skipped"], result["turns"]))
+
+    if verbose:
+        print()
+        print(f"  {'ACCOUNT':<16} {'NEW':>6} {'UPD':>6} {'SKIP':>6} {'TURNS':>8}")
+        print(f"  {'-'*16} {'-'*6} {'-'*6} {'-'*6} {'-'*8}")
+        for name, new, upd, skip, turns in rows:
+            print(f"  {name:<16} {new:>6} {upd:>6} {skip:>6} {turns:>8}")
+        print()
+
+    conn.close()
+    return rows
 
 
 if __name__ == "__main__":
