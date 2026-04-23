@@ -339,13 +339,24 @@ def cmd_dashboard(projects_dir=None):
     host = os.environ.get("HOST", "localhost")
     port = int(os.environ.get("PORT", "8080"))
 
+    bound = {"port": port}
+
     def open_browser():
-        time.sleep(1.0)
-        webbrowser.open(f"http://{host}:{port}")
+        # Wait until serve() reports the actual bound port — may differ from
+        # the requested one if we fell back (Windows holds 8080 via svchost).
+        for _ in range(20):
+            if bound.get("bound"):
+                break
+            time.sleep(0.1)
+        webbrowser.open(f"http://{host}:{bound['port']}")
+
+    def on_bind(actual_port):
+        bound["port"] = actual_port
+        bound["bound"] = True
 
     t = threading.Thread(target=open_browser, daemon=True)
     t.start()
-    serve(host=host, port=port)
+    serve(host=host, port=port, on_bind=on_bind)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

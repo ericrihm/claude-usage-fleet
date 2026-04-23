@@ -1464,16 +1464,36 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
 
-def serve(host=None, port=None):
+def serve(host=None, port=None, on_bind=None):
+    """Start the dashboard server. on_bind, if supplied, is called once with
+    the actual bound port — cli.py uses this to point the browser at the
+    real port when a fallback kicks in (port 8080 is often held by svchost
+    on Windows)."""
     host = host or os.environ.get("HOST", "localhost")
     port = port or int(os.environ.get("PORT", "8080"))
-    server = HTTPServer((host, port), DashboardHandler)
-    print(f"Dashboard running at http://{host}:{port}")
-    print("Press Ctrl+C to stop.")
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\nStopped.")
+    ladder = [port] if port != 8080 else [8080, 8081, 8082, 8090, 9080]
+    last_err = None
+    for candidate in ladder:
+        try:
+            server = HTTPServer((host, candidate), DashboardHandler)
+            if candidate != port:
+                print(f"  (port {port} unavailable — using {candidate} instead)")
+            print(f"Dashboard running at http://{host}:{candidate}")
+            print("Press Ctrl+C to stop.")
+            if on_bind:
+                try:
+                    on_bind(candidate)
+                except Exception:
+                    pass
+            try:
+                server.serve_forever()
+            except KeyboardInterrupt:
+                print("\nStopped.")
+            return
+        except (PermissionError, OSError) as e:
+            last_err = e
+            continue
+    raise last_err or OSError("no usable port found in ladder")
 
 
 if __name__ == "__main__":
